@@ -171,9 +171,8 @@ Main dependencies:
 - safetensors (for model saving)
 - pyyaml (for config files)
 - av (for video processing)
-- dask[dataframe] (for loading Hugging Face datasets via hf:// protocol)
-- fsspec (for filesystem abstraction)
-- hf-file-system (for Hugging Face filesystem support)
+- huggingface_hub (for direct access to Hugging Face datasets)
+- pyarrow (for reading parquet files directly)
 
 Most base dependencies are already in `pyproject.toml`.
 

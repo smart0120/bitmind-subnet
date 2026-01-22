@@ -11,10 +11,9 @@ safetensors>=0.4.0
 # Config file handling
 pyyaml>=6.0
 
-# Dataset loading with Dask
-dask[dataframe]>=2024.1.0
-fsspec>=2024.1.0
-hf-file-system>=0.0.1
+# Dataset loading with Hugging Face Hub (direct file access)
+huggingface_hub>=0.20.0
+pyarrow>=14.0.0
 
 # Already in pyproject.toml but listed for reference:
 # torch>=2.0.0

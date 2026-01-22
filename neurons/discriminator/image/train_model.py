@@ -2,14 +2,19 @@
 Image Detector Training Script
 Loads datasets from Hugging Face and trains a multiclass classifier (real, synthetic, semisynthetic)
 using ELA+PRNU fusion features. Outputs model in Safetensors format for submission.
+
+Uses PyTorch DataLoader with direct parquet file reading (no load_dataset).
 """
 
 import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Any
 from datetime import datetime
+from io import BytesIO
+import base64
+import tempfile
 
 import cv2
 import numpy as np
@@ -20,9 +25,17 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
-import dask.dataframe as dd
+import pyarrow.parquet as pq
 from safetensors.torch import save_file
 import yaml
+
+# Import Hugging Face Hub for direct file access
+try:
+    from huggingface_hub import hf_hub_download, list_repo_files
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+    print("WARNING: huggingface_hub not found. Please install with: pip install huggingface_hub")
 
 # Import model and preprocessing from local modules
 try:
@@ -45,7 +58,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Dataset Configuration
 # ---------------------------
 # Real image datasets
-# Note: All datasets are loaded using Dask (hf:// protocol) for efficient handling of large datasets
 REAL_DATASETS = [
     "drawthingsai/megalith-10m",
     "bitmind/open-image-v7",
@@ -109,59 +121,59 @@ def make_feature(rgb: np.ndarray) -> np.ndarray:
     feat = np.concatenate([ela, prnu[..., None]], axis=-1)
     return feat.astype(np.float32)
 
+def load_image_from_data(data: Any, img_size: Tuple[int, int]) -> Image.Image:
+    """Load image from various formats (PIL Image, bytes, dict, path)."""
+    if isinstance(data, Image.Image):
+        im = data.convert("RGB")
+    elif isinstance(data, (bytes, bytearray)):
+        im = Image.open(BytesIO(data)).convert("RGB")
+    elif isinstance(data, str):
+        # Try base64 decode first
+        if len(data) > 100 and not (data.startswith('http') or '/' in data or '\\' in data):
+            try:
+                img_bytes = base64.b64decode(data)
+                im = Image.open(BytesIO(img_bytes)).convert("RGB")
+            except:
+                # Assume it's a file path
+                im = pil_load_rgb(data, img_size)
+        else:
+            im = pil_load_rgb(data, img_size)
+    elif isinstance(data, dict):
+        # Try common keys
+        for key in ['image', 'bytes', 'path', 'file_path', 'file']:
+            if key in data:
+                return load_image_from_data(data[key], img_size)
+        # Use first value
+        first_val = list(data.values())[0]
+        return load_image_from_data(first_val, img_size)
+    else:
+        raise ValueError(f"Unknown image data type: {type(data)}")
+    
+    if img_size and (im.size[0] != img_size[0] or im.size[1] != img_size[1]):
+        im = im.resize(img_size, Image.Resampling.LANCZOS)
+    
+    return im
+
 # ---------------------------
-# Dataset Class
+# Dataset Classes
 # ---------------------------
 class ImageDataset(Dataset):
-    """Dataset class for loading images from Hugging Face datasets."""
+    """PyTorch Dataset for loading images."""
     
-    def __init__(self, image_paths: List[str], labels: List[int], img_size: Tuple[int, int]):
-        self.image_paths = image_paths
+    def __init__(self, image_data: List[Any], labels: List[int], img_size: Tuple[int, int]):
+        self.image_data = image_data
         self.labels = labels
         self.img_size = img_size
     
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_data)
     
     def __getitem__(self, idx):
-        path = self.image_paths[idx]
+        data = self.image_data[idx]
         label = self.labels[idx]
         
         try:
-            # Load image
-            if isinstance(path, dict):
-                # Hugging Face dataset format
-                if 'image' in path:
-                    im = path['image']
-                    if not isinstance(im, Image.Image):
-                        im = pil_load_rgb(im, self.img_size)
-                    else:
-                        im = im.convert("RGB")
-                elif 'path' in path:
-                    im = pil_load_rgb(path['path'], self.img_size)
-                else:
-                    # Try to find any image-like field
-                    for key in ['image', 'img', 'file_path', 'file', 'path']:
-                        if key in path:
-                            val = path[key]
-                            if isinstance(val, Image.Image):
-                                im = val.convert("RGB")
-                            elif isinstance(val, str):
-                                im = pil_load_rgb(val, self.img_size)
-                            break
-                    else:
-                        raise ValueError(f"Unknown path format: {list(path.keys())}")
-            elif isinstance(path, Image.Image):
-                # Already a PIL Image
-                im = path.convert("RGB")
-            else:
-                # String path
-                im = pil_load_rgb(path, self.img_size)
-            
-            # Resize if needed
-            if self.img_size and (im.size[0] != self.img_size[0] or im.size[1] != self.img_size[1]):
-                im = im.resize(self.img_size, Image.Resampling.LANCZOS)
-            
+            im = load_image_from_data(data, self.img_size)
             rgb = to_numpy(im)
             feat = make_feature(rgb)  # Shape: (H, W, 4)
             
@@ -172,74 +184,157 @@ class ImageDataset(Dataset):
             return feat_tensor, label_tensor
         
         except Exception as e:
-            print(f"Error loading image {path}: {e}")
+            print(f"Error loading image {idx}: {e}")
             # Return zero tensor on error
             C = 4  # ELA (3) + PRNU (1)
             H, W = self.img_size[1], self.img_size[0]
             return torch.zeros(C, H, W), torch.tensor(0, dtype=torch.long)
 
 # ---------------------------
-# Dataset Loading from Hugging Face
+# Dataset Loading from Hugging Face (Direct Parquet Reading)
 # ---------------------------
-def load_hf_dataset(
+def load_hf_dataset_from_parquet(
     dataset_name: str, 
-    split: str = "train"
-):
+    split: str = "train",
+    max_samples: int = None,
+    max_parquet_files: int = 10
+) -> List[Any]:
     """
-    Load dataset from Hugging Face using Dask.
+    Load dataset from Hugging Face by reading parquet files directly.
+    Uses huggingface_hub to download and pyarrow to read parquet files.
     
     Args:
         dataset_name: Name of the dataset (e.g., "bitmind/ffhq-256")
         split: Dataset split to load (e.g., "train")
+        max_samples: Maximum number of samples to load (None for all)
+        max_parquet_files: Maximum number of parquet files to process
     """
+    if not HAS_HF_HUB:
+        raise ImportError(
+            "huggingface_hub is required. Please install it with:\n"
+            "  pip install huggingface_hub\n"
+            "Or install all training requirements:\n"
+            "  pip install -r requirements_training.txt"
+        )
+    
     try:
         print(f"Loading {dataset_name} (split: {split})...")
         
-        # Try different path patterns for Hugging Face datasets
-        hf_paths = [
-            f"hf://datasets/{dataset_name}/data/{split}-*.parquet",
-            f"hf://datasets/{dataset_name}/{split}",
-            f"hf://datasets/{dataset_name}/data/{split}",
-        ]
+        # List parquet files in the dataset
+        try:
+            all_files = list_repo_files(repo_id=dataset_name, repo_type="dataset")
+            parquet_files = [f for f in all_files if f.endswith('.parquet') and split in f]
+            
+            # Also check in data/ subdirectory
+            if not parquet_files:
+                data_files = [f for f in all_files if 'data' in f and f.endswith('.parquet')]
+                parquet_files = [f for f in data_files if split in f]
+            
+            # If still no files, try any parquet file
+            if not parquet_files:
+                parquet_files = [f for f in all_files if f.endswith('.parquet')]
+            
+            if not parquet_files:
+                print(f"  ⚠️  No parquet files found in {dataset_name}")
+                return []
+            
+            # Limit number of parquet files to process
+            parquet_files = parquet_files[:max_parquet_files]
+            print(f"  Found {len(parquet_files)} parquet file(s)")
+            
+        except Exception as e:
+            print(f"  ⚠️  Error listing files: {e}")
+            return []
         
-        df = None
-        for hf_path in hf_paths:
-            try:
-                print(f"  Trying path: {hf_path}")
-                df = dd.read_parquet(hf_path)
-                print(f"  ✓ Successfully loaded with path: {hf_path}")
+        image_data = []
+        count = 0
+        
+        # Process each parquet file
+        for parquet_file in parquet_files:
+            if max_samples and count >= max_samples:
                 break
+            
+            try:
+                print(f"  Processing {parquet_file}...")
+                
+                # Download parquet file (returns path to cached file)
+                try:
+                    tmp_path = hf_hub_download(
+                        repo_id=dataset_name,
+                        filename=parquet_file,
+                        repo_type="dataset"
+                    )
+                    
+                    # Read parquet file
+                    table = pq.read_table(tmp_path)
+                    df = table.to_pandas()
+                    
+                    # Find image column
+                    image_col = None
+                    for col in ['image', 'path', 'file_path', 'file', 'img', 'image_path']:
+                        if col in df.columns:
+                            image_col = col
+                            break
+                    
+                    if image_col is None:
+                        # Try to find any column with image-like data
+                        for col in df.columns:
+                            if 'image' in col.lower() and '_id' not in col.lower():
+                                image_col = col
+                                break
+                    
+                    if image_col is None:
+                        print(f"    ⚠️  No image column found in {parquet_file}")
+                        continue
+                    
+                    # Extract image data
+                    for _, row in df.iterrows():
+                        if max_samples and count >= max_samples:
+                            break
+                        
+                        try:
+                            img_data = row[image_col]
+                            
+                            if pd.isna(img_data) or img_data is None:
+                                continue
+                            
+                            # Handle different data types
+                            if isinstance(img_data, Image.Image):
+                                image_data.append(img_data)
+                                count += 1
+                            elif isinstance(img_data, (bytes, bytearray)):
+                                image_data.append(img_data)
+                                count += 1
+                            elif isinstance(img_data, str):
+                                # Could be path or base64
+                                image_data.append(img_data)
+                                count += 1
+                            elif isinstance(img_data, dict):
+                                # Extract bytes or image from dict
+                                for key in ['bytes', 'image', 'data', 'content']:
+                                    if key in img_data:
+                                        image_data.append(img_data[key])
+                                        count += 1
+                                        break
+                            
+                            if count % 10000 == 0:
+                                print(f"    Loaded {count} images so far...")
+                        
+                        except Exception as e:
+                            continue
+                    
+                    print(f"    Loaded {len(image_data) - (count - df.shape[0])} images from {parquet_file}")
+                
+                except Exception as e:
+                    print(f"    ⚠️  Error reading parquet: {e}")
+                    continue
+            
             except Exception as e:
-                print(f"  ✗ Failed: {e}")
+                print(f"    ⚠️  Error processing {parquet_file}: {e}")
                 continue
         
-        if df is None:
-            raise ValueError(f"Could not load dataset {dataset_name} with any path pattern")
-        
-        # Get dataset info
-        num_partitions = df.npartitions
-        print(f"  Dataset has {num_partitions} partitions")
-        
-        # Extract image paths from Dask DataFrame
-        image_paths = []
-        items_processed = 0
-        
-        # Iterate through partitions
-        for partition_idx in range(num_partitions):
-            partition_df = df.get_partition(partition_idx).compute()
-            
-            for _, row in partition_df.iterrows():
-                processed = _extract_image_path_from_row(row)
-                if processed:
-                    image_paths.append(processed)
-                    items_processed += 1
-                
-                # Print progress every 10000 items
-                if items_processed % 10000 == 0:
-                    print(f"    Loaded {items_processed} images so far...")
-        
-        print(f"Loaded {len(image_paths)} images from {dataset_name}")
-        return image_paths
+        print(f"Loaded {len(image_data)} total images from {dataset_name}")
+        return image_data
     
     except Exception as e:
         print(f"  ⚠️  Error loading {dataset_name}: {e}")
@@ -248,67 +343,53 @@ def load_hf_dataset(
         return []
 
 
-def _extract_image_path_from_row(row):
-    """Extract image path from a pandas DataFrame row."""
-    # Try common column names for image paths
-    for col_name in ['image', 'path', 'file_path', 'file', 'img', 'image_path', 'url']:
-        if col_name in row.index:
-            val = row[col_name]
-            if pd.notna(val):
-                if isinstance(val, str):
-                    return val
-                elif isinstance(val, Image.Image):
-                    return {'image': val}  # Return dict format for PIL Image
-                elif isinstance(val, dict):
-                    return val
-    
-    # Try to find any column that might contain image data
-    for col_name in row.index:
-        val = row[col_name]
-        if pd.notna(val):
-            if isinstance(val, str) and (val.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')) or '/' in val or '\\' in val):
-                return val
-            elif isinstance(val, Image.Image):
-                return {'image': val}
-            elif isinstance(val, dict):
-                return val
-    
-    # If no image path found, return None
-    return None
-
 def load_all_datasets(
     real_datasets: List[str],
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
-    balance_classes: bool = True
-) -> Tuple[List[str], List[int]]:
+    balance_classes: bool = True,
+    max_samples_per_dataset: int = None,
+    max_parquet_files: int = 10
+) -> Tuple[List[Any], List[int]]:
     """Load all datasets and create labeled dataset."""
     
-    all_paths = []
+    all_data = []
     all_labels = []
     
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
     for ds_name in real_datasets:
-        paths = load_hf_dataset(ds_name, split="train")
-        all_paths.extend(paths)
-        all_labels.extend([0] * len(paths))
+        data = load_hf_dataset_from_parquet(
+            ds_name, split="train", 
+            max_samples=max_samples_per_dataset,
+            max_parquet_files=max_parquet_files
+        )
+        all_data.extend(data)
+        all_labels.extend([0] * len(data))
     
     # Load synthetic images (label 1)
     print("\n=== Loading Synthetic Images ===")
     for ds_name in synthetic_datasets:
-        paths = load_hf_dataset(ds_name, split="train")
-        all_paths.extend(paths)
-        all_labels.extend([1] * len(paths))
+        data = load_hf_dataset_from_parquet(
+            ds_name, split="train",
+            max_samples=max_samples_per_dataset,
+            max_parquet_files=max_parquet_files
+        )
+        all_data.extend(data)
+        all_labels.extend([1] * len(data))
     
     # Load semisynthetic images (label 2)
     print("\n=== Loading Semi-synthetic Images ===")
     for ds_name in semisynthetic_datasets:
-        paths = load_hf_dataset(ds_name, split="train")
-        all_paths.extend(paths)
-        all_labels.extend([2] * len(paths))
+        data = load_hf_dataset_from_parquet(
+            ds_name, split="train",
+            max_samples=max_samples_per_dataset,
+            max_parquet_files=max_parquet_files
+        )
+        all_data.extend(data)
+        all_labels.extend([2] * len(data))
     
-    print(f"\nTotal samples: {len(all_paths)}")
+    print(f"\nTotal samples: {len(all_data)}")
     print(f"  Real: {sum(1 for l in all_labels if l == 0)}")
     print(f"  Synthetic: {sum(1 for l in all_labels if l == 1)}")
     print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2)}")
@@ -319,19 +400,19 @@ def load_all_datasets(
         min_count = min(counts)
         print(f"\nBalancing to {min_count} samples per class...")
         
-        balanced_paths = []
+        balanced_data = []
         balanced_labels = []
         for label in range(3):
-            label_paths = [p for p, l in zip(all_paths, all_labels) if l == label]
-            balanced_paths.extend(label_paths[:min_count])
+            label_data = [d for d, l in zip(all_data, all_labels) if l == label]
+            balanced_data.extend(label_data[:min_count])
             balanced_labels.extend([label] * min_count)
         
-        all_paths = balanced_paths
+        all_data = balanced_data
         all_labels = balanced_labels
         
-        print(f"After balancing: {len(all_paths)} samples")
+        print(f"After balancing: {len(all_data)} samples")
     
-    return all_paths, all_labels
+    return all_data, all_labels
 
 # ---------------------------
 # Training Function
@@ -518,32 +599,34 @@ def main(args):
     
     # Load datasets
     print("\n" + "="*50)
-    print("LOADING DATASETS FROM HUGGING FACE")
+    print("LOADING DATASETS FROM HUGGING FACE (Direct Parquet Reading)")
     print("="*50)
     
-    all_paths, all_labels = load_all_datasets(
+    all_data, all_labels = load_all_datasets(
         real_datasets=REAL_DATASETS if not args.real_datasets else args.real_datasets,
         synthetic_datasets=SYNTHETIC_DATASETS if not args.synthetic_datasets else args.synthetic_datasets,
         semisynthetic_datasets=SEMISYNTHETIC_DATASETS if not args.semisynthetic_datasets else args.semisynthetic_datasets,
-        balance_classes=args.balance
+        balance_classes=args.balance,
+        max_samples_per_dataset=args.max_samples_per_dataset,
+        max_parquet_files=args.max_parquet_files
     )
     
-    if len(all_paths) == 0:
+    if len(all_data) == 0:
         print("Error: No images loaded!")
         return
     
     # Split train/val
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        all_paths, all_labels, test_size=0.2, random_state=args.seed, stratify=all_labels
+    train_data, val_data, train_labels, val_labels = train_test_split(
+        all_data, all_labels, test_size=0.2, random_state=args.seed, stratify=all_labels
     )
     
-    print(f"\nTrain samples: {len(train_paths)}")
-    print(f"Val samples: {len(val_paths)}")
+    print(f"\nTrain samples: {len(train_data)}")
+    print(f"Val samples: {len(val_data)}")
     
     # Create datasets
     img_size = (args.img_size[0], args.img_size[1])
-    train_dataset = ImageDataset(train_paths, train_labels, img_size)
-    val_dataset = ImageDataset(val_paths, val_labels, img_size)
+    train_dataset = ImageDataset(train_data, train_labels, img_size)
+    val_dataset = ImageDataset(val_data, val_labels, img_size)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -634,6 +717,10 @@ if __name__ == "__main__":
                         help="Custom list of semisynthetic image datasets")
     parser.add_argument("--balance", action="store_true", default=True,
                         help="Balance classes by taking min samples per class")
+    parser.add_argument("--max-samples-per-dataset", type=int, default=None,
+                        help="Maximum samples to load per dataset (None for all)")
+    parser.add_argument("--max-parquet-files", type=int, default=10,
+                        help="Maximum parquet files to process per dataset")
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
@@ -660,7 +747,7 @@ if __name__ == "__main__":
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Balance Classes: {args.balance}")
-    print(f"Using Dask for dataset loading (hf:// protocol)")
+    print(f"Using PyTorch DataLoader with direct parquet file reading")
     print("="*50 + "\n")
     
     main(args)
