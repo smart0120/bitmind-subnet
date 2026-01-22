@@ -15,6 +15,7 @@ from datetime import datetime
 from io import BytesIO
 import base64
 import tempfile
+import warnings
 
 import cv2
 import numpy as np
@@ -28,6 +29,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 from safetensors.torch import save_file
 import yaml
+
+# Suppress scipy.signal warnings about division by zero
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='scipy.signal')
 
 # Import Hugging Face Hub for direct file access
 try:
@@ -119,21 +123,51 @@ def make_feature(rgb: np.ndarray) -> np.ndarray:
     prnu = extract_prnu_enhanced(rgb)  # Single channel
     ela = extract_ela_enhanced(rgb)     # 3 channels (RGB)
     feat = np.concatenate([ela, prnu[..., None]], axis=-1)
+    
+    # Final NaN/Inf check and cleanup
+    feat = np.nan_to_num(feat, nan=0.0, posinf=1.0, neginf=0.0)
+    
     return feat.astype(np.float32)
 
-def load_image_from_data(data: Any, img_size: Tuple[int, int]) -> Image.Image:
-    """Load image from various formats (PIL Image, bytes, dict, path)."""
+def load_image_from_data(data: Any, img_size: Tuple[int, int], max_size_mb: float = 50.0) -> Image.Image:
+    """
+    Load image from various formats (PIL Image, bytes, dict, path).
+    
+    Args:
+        data: Image data in various formats
+        img_size: Target image size
+        max_size_mb: Maximum image size in MB before decompression (default: 50MB)
+    """
     if isinstance(data, Image.Image):
         im = data.convert("RGB")
     elif isinstance(data, (bytes, bytearray)):
-        im = Image.open(BytesIO(data)).convert("RGB")
+        # Check size before loading
+        size_mb = len(data) / (1024 * 1024)
+        if size_mb > max_size_mb:
+            raise ValueError(f"Image too large: {size_mb:.2f}MB (max: {max_size_mb}MB)")
+        
+        try:
+            im = Image.open(BytesIO(data))
+            # Check decompressed size
+            if im.size[0] * im.size[1] > 10000 * 10000:  # 100MP limit
+                raise ValueError(f"Decompressed image too large: {im.size[0]}x{im.size[1]}")
+            im = im.convert("RGB")
+        except Exception as e:
+            if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
+                raise ValueError(f"Decompressed Data Too Large: {size_mb:.2f}MB")
+            raise
     elif isinstance(data, str):
         # Try base64 decode first
         if len(data) > 100 and not (data.startswith('http') or '/' in data or '\\' in data):
             try:
                 img_bytes = base64.b64decode(data)
+                size_mb = len(img_bytes) / (1024 * 1024)
+                if size_mb > max_size_mb:
+                    raise ValueError(f"Image too large: {size_mb:.2f}MB (max: {max_size_mb}MB)")
                 im = Image.open(BytesIO(img_bytes)).convert("RGB")
-            except:
+            except Exception as e:
+                if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
+                    raise ValueError(f"Decompressed Data Too Large")
                 # Assume it's a file path
                 im = pil_load_rgb(data, img_size)
         else:
@@ -142,10 +176,10 @@ def load_image_from_data(data: Any, img_size: Tuple[int, int]) -> Image.Image:
         # Try common keys
         for key in ['image', 'bytes', 'path', 'file_path', 'file']:
             if key in data:
-                return load_image_from_data(data[key], img_size)
+                return load_image_from_data(data[key], img_size, max_size_mb)
         # Use first value
         first_val = list(data.values())[0]
-        return load_image_from_data(first_val, img_size)
+        return load_image_from_data(first_val, img_size, max_size_mb)
     else:
         raise ValueError(f"Unknown image data type: {type(data)}")
     
@@ -173,18 +207,32 @@ class ImageDataset(Dataset):
         label = self.labels[idx]
         
         try:
-            im = load_image_from_data(data, self.img_size)
+            im = load_image_from_data(data, self.img_size, max_size_mb=50.0)
             rgb = to_numpy(im)
             feat = make_feature(rgb)  # Shape: (H, W, 4)
             
+            # Check for NaN/Inf before converting to tensor
+            if np.any(np.isnan(feat)) or np.any(np.isinf(feat)):
+                raise ValueError("NaN or Inf values in features")
+            
             # Convert to tensor: (C, H, W)
             feat_tensor = torch.from_numpy(feat).permute(2, 0, 1).float()
+            
+            # Final check for NaN/Inf in tensor
+            if torch.any(torch.isnan(feat_tensor)) or torch.any(torch.isinf(feat_tensor)):
+                raise ValueError("NaN or Inf values in tensor")
+            
             label_tensor = torch.tensor(label, dtype=torch.long)
             
             return feat_tensor, label_tensor
         
         except Exception as e:
-            print(f"Error loading image {idx}: {e}")
+            # Silently skip problematic images (don't print every error to avoid spam)
+            if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
+                pass  # Skip silently for size errors
+            elif idx % 1000 == 0:  # Only print every 1000th error
+                print(f"Error loading image {idx}: {e}")
+            
             # Return zero tensor on error
             C = 4  # ELA (3) + PRNU (1)
             H, W = self.img_size[1], self.img_size[0]
@@ -448,10 +496,31 @@ def train_model(
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
             
+            # Check for NaN/Inf in input
+            if torch.any(torch.isnan(data)) or torch.any(torch.isinf(data)):
+                print(f"Warning: NaN/Inf detected in batch {batch_idx}, skipping...")
+                continue
+            
             optimizer.zero_grad()
             output = model(data)
+            
+            # Check for NaN/Inf in output
+            if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
+                print(f"Warning: NaN/Inf in model output at batch {batch_idx}, skipping...")
+                continue
+            
             loss = criterion(output, target)
+            
+            # Check for NaN/Inf in loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping...")
+                continue
+            
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
