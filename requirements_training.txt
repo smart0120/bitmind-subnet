@@ -1,0 +1,22 @@
+# Additional requirements for training the image detector
+# Most base dependencies are already in pyproject.toml
+
+# Feature extraction
+PyWavelets>=1.4.1
+scipy>=1.11.0
+
+# Model saving
+safetensors>=0.4.0
+
+# Config file handling
+pyyaml>=6.0
+
+# Already in pyproject.toml but listed for reference:
+# torch>=2.0.0
+# torchvision>=0.15.0
+# opencv-python>=4.8.0
+# numpy>=2.0.0
+# pandas>=2.0.0
+# scikit-learn>=1.3.0
+# datasets>=2.14.0
+# pillow>=10.0.0
