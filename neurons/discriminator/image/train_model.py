@@ -45,6 +45,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Dataset Configuration
 # ---------------------------
 # Real image datasets
+# Note: All datasets are loaded using streaming mode to handle large datasets efficiently
 REAL_DATASETS = [
     "drawthingsai/megalith-10m",
     "bitmind/open-image-v7",
@@ -180,63 +181,85 @@ class ImageDataset(Dataset):
 # ---------------------------
 # Dataset Loading from Hugging Face
 # ---------------------------
-def load_hf_dataset(dataset_name: str, split: str = "train", max_samples: int = None):
-    """Load dataset from Hugging Face."""
+def load_hf_dataset(
+    dataset_name: str, 
+    split: str = "train"
+):
+    """
+    Load dataset from Hugging Face using streaming mode.
+    
+    Args:
+        dataset_name: Name of the dataset
+        split: Dataset split to load
+    """
     try:
         print(f"Loading {dataset_name} (split: {split})...")
-        dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
         
-        # Limit samples if specified
-        if max_samples and len(dataset) > max_samples:
-            dataset = dataset.select(range(max_samples))
+        # Use streaming mode by default to handle large datasets efficiently
+        print(f"  Using streaming mode...")
+        dataset = load_dataset(dataset_name, split=split, streaming=True)
         
         # Extract image paths
         image_paths = []
+        items_processed = 0
+        
         for item in dataset:
-            if isinstance(item, dict):
-                if 'image' in item:
-                    # Image is already loaded as PIL Image
-                    image_paths.append(item)
-                elif 'path' in item:
-                    image_paths.append(item['path'])
-                else:
-                    # Try to find image field
-                    found = False
-                    for key in ['image', 'img', 'file_path', 'file', 'path']:
-                        if key in item:
-                            val = item[key]
-                            if isinstance(val, Image.Image):
-                                image_paths.append(item)
-                            elif isinstance(val, str):
-                                image_paths.append(val)
-                            found = True
-                            break
-                    if not found:
-                        # Use the first value if it's a path-like string or PIL Image
-                        first_val = list(item.values())[0]
-                        if isinstance(first_val, Image.Image):
-                            image_paths.append(item)
-                        elif isinstance(first_val, str):
-                            image_paths.append(first_val)
-            elif isinstance(item, Image.Image):
-                # Direct PIL Image
-                image_paths.append(item)
-            elif isinstance(item, str):
-                # Direct path string
-                image_paths.append(item)
+            processed = _extract_image_path_from_item(item)
+            if processed:
+                image_paths.append(processed)
+                items_processed += 1
+            
+            # Print progress every 10000 items
+            if items_processed % 10000 == 0:
+                print(f"    Loaded {items_processed} images so far...")
         
         print(f"Loaded {len(image_paths)} images from {dataset_name}")
         return image_paths
     
     except Exception as e:
-        print(f"Error loading {dataset_name}: {e}")
+        error_msg = str(e)
+        if "Decompressed Data Too Large" in error_msg or "too large" in error_msg.lower():
+            print(f"  ⚠️  Skipping {dataset_name}: Dataset too large to decompress. Consider removing from dataset list.")
+        else:
+            print(f"  ⚠️  Error loading {dataset_name}: {e}")
         return []
+
+
+def _extract_image_path_from_item(item):
+    """Extract image path from a dataset item."""
+    if isinstance(item, dict):
+        if 'image' in item:
+            # Image is already loaded as PIL Image
+            return item
+        elif 'path' in item:
+            return item['path']
+        else:
+            # Try to find image field
+            for key in ['image', 'img', 'file_path', 'file', 'path']:
+                if key in item:
+                    val = item[key]
+                    if isinstance(val, Image.Image):
+                        return item
+                    elif isinstance(val, str):
+                        return val
+            # Use the first value if it's a path-like string or PIL Image
+            first_val = list(item.values())[0]
+            if isinstance(first_val, Image.Image):
+                return item
+            elif isinstance(first_val, str):
+                return first_val
+    elif isinstance(item, Image.Image):
+        # Direct PIL Image
+        return item
+    elif isinstance(item, str):
+        # Direct path string
+        return item
+    return None
 
 def load_all_datasets(
     real_datasets: List[str],
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
-    max_samples_per_dataset: int = None,
     balance_classes: bool = True
 ) -> Tuple[List[str], List[int]]:
     """Load all datasets and create labeled dataset."""
@@ -247,21 +270,21 @@ def load_all_datasets(
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
     for ds_name in real_datasets:
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        paths = load_hf_dataset(ds_name, split="train")
         all_paths.extend(paths)
         all_labels.extend([0] * len(paths))
     
     # Load synthetic images (label 1)
     print("\n=== Loading Synthetic Images ===")
     for ds_name in synthetic_datasets:
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        paths = load_hf_dataset(ds_name, split="train")
         all_paths.extend(paths)
         all_labels.extend([1] * len(paths))
     
     # Load semisynthetic images (label 2)
     print("\n=== Loading Semi-synthetic Images ===")
     for ds_name in semisynthetic_datasets:
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        paths = load_hf_dataset(ds_name, split="train")
         all_paths.extend(paths)
         all_labels.extend([2] * len(paths))
     
@@ -482,7 +505,6 @@ def main(args):
         real_datasets=REAL_DATASETS if not args.real_datasets else args.real_datasets,
         synthetic_datasets=SYNTHETIC_DATASETS if not args.synthetic_datasets else args.synthetic_datasets,
         semisynthetic_datasets=SEMISYNTHETIC_DATASETS if not args.semisynthetic_datasets else args.semisynthetic_datasets,
-        max_samples_per_dataset=args.max_samples_per_dataset,
         balance_classes=args.balance
     )
     
@@ -590,8 +612,6 @@ if __name__ == "__main__":
                         help="Custom list of synthetic image datasets")
     parser.add_argument("--semisynthetic-datasets", type=str, nargs="+", default=None,
                         help="Custom list of semisynthetic image datasets")
-    parser.add_argument("--max-samples-per-dataset", type=int, default=None,
-                        help="Maximum samples to load per dataset (for testing)")
     parser.add_argument("--balance", action="store_true", default=True,
                         help="Balance classes by taking min samples per class")
     
@@ -620,6 +640,7 @@ if __name__ == "__main__":
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Balance Classes: {args.balance}")
+    print(f"Using streaming mode for dataset loading")
     print("="*50 + "\n")
     
     main(args)
