@@ -149,7 +149,7 @@ def load_image_from_data(data: Any, img_size: Tuple[int, int], max_size_mb: floa
         try:
             im = Image.open(BytesIO(data))
             # Check decompressed size
-            if im.size[0] * im.size[1] > 10000 * 10000:  # 100MP limit
+            if im.size[0] * im.size[1] > 10000 * 100000:  # 1000MP limit
                 raise ValueError(f"Decompressed image too large: {im.size[0]}x{im.size[1]}")
             im = im.convert("RGB")
         except Exception as e:
@@ -371,7 +371,7 @@ def load_hf_dataset_from_parquet(
                                         count += 1
                                         break
                             
-                            if count % 10000 == 0:
+                            if count % 100000 == 0:
                                 print(f"    Loaded {count} images so far...")
                         
                         except Exception as e:
