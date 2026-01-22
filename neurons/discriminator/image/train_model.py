@@ -924,6 +924,8 @@ if __name__ == "__main__":
                         help="Maximum samples to load per dataset (None for all, default: None = ALL)")
     parser.add_argument("--max-parquet-files", type=int, default=None,
                         help="Maximum parquet files to process per dataset (None for all, default: None = ALL)")
+    parser.add_argument("--chunk-size", type=int, default=100000,
+                        help="Number of images to process in each chunk when loading from parquet files (default: 100000)")
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=256, 
