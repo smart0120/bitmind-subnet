@@ -82,7 +82,7 @@ SYNTHETIC_DATASETS = [
     "bitmind/GenImage_MidJourney",
     "bitmind/bm-aura-imagegen",
     "bitmind/bm-imagine",
-    "datasets/Yejy53/Echo-4o-Image",
+    "Yejy53/Echo-4o-Image",
     "bitmind/bm-sdxl",
     "bitmind/bm-mobius",
     "bitmind/bm-realvisxl",
@@ -430,7 +430,7 @@ def train_model(
     
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
     best_val_acc = 0.0
     train_losses = []
