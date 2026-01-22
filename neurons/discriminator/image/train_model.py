@@ -46,17 +46,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------------------
 # Real image datasets
 REAL_DATASETS = [
+    "drawthingsai/megalith-10m",
+    "bitmind/open-image-v7",
     "bitmind/bm-eidon-image",
     "bitmind/bm-real",
     "bitmind/open-image-v7-256",
     "bitmind/celeb-a-hq",
     "bitmind/ffhq-256",
+    "bitmind/MS-COCO-unique",
     "bitmind/MS-COCO-unique-256",
     "bitmind/AFHQ",
     "bitmind/lfw",
     "bitmind/caltech-256",
     "bitmind/caltech-101",
     "bitmind/dtd",
+    "bitmind/ffhq-jpg",
 ]
 
 # Synthetic image datasets
@@ -65,10 +69,7 @@ SYNTHETIC_DATASETS = [
     "bitmind/GenImage_MidJourney",
     "bitmind/bm-aura-imagegen",
     "bitmind/bm-imagine",
-    "bitmind/ffhq-256___stable-diffusion-xl-base-1.0",
-    "bitmind/celeb-a-hq___stable-diffusion-xl-base-1.0",
-    "bitmind/celeb-a-hq___FLUX.1-dev",
-    "bitmind/ffhq-256___FLUX.1-dev",
+    "datasets/Yejy53/Echo-4o-Image",
     "bitmind/bm-sdxl",
     "bitmind/bm-mobius",
     "bitmind/bm-realvisxl",
@@ -78,8 +79,12 @@ SYNTHETIC_DATASETS = [
 # Semi-synthetic image datasets
 SEMISYNTHETIC_DATASETS = [
     "bitmind/face-swap",
-    "bitmind/ffhq-256_training_faces",
-    "bitmind/celeb-a-hq_training_faces",
+    "bitmind/ffhq-256___stable-diffusion-xl-base-1.0",
+    "bitmind/celeb-a-hq___stable-diffusion-xl-base-1.0",
+    "bitmind/celeb-a-hq___FLUX.1-dev",
+    "bitmind/ffhq-256___FLUX.1-dev",
+    "bitmind/MS-COCO-unique___FLUX.1-dev",
+    "bitmind/MS-COCO-unique___stable-diffusion-xl-base-1.0"
 ]
 
 # ---------------------------
