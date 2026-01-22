@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
-from datasets import load_dataset
+import dask.dataframe as dd
 from safetensors.torch import save_file
 import yaml
 
@@ -45,7 +45,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Dataset Configuration
 # ---------------------------
 # Real image datasets
-# Note: All datasets are loaded using streaming mode to handle large datasets efficiently
+# Note: All datasets are loaded using Dask (hf:// protocol) for efficient handling of large datasets
 REAL_DATASETS = [
     "drawthingsai/megalith-10m",
     "bitmind/open-image-v7",
@@ -186,74 +186,94 @@ def load_hf_dataset(
     split: str = "train"
 ):
     """
-    Load dataset from Hugging Face using streaming mode.
+    Load dataset from Hugging Face using Dask.
     
     Args:
-        dataset_name: Name of the dataset
-        split: Dataset split to load
+        dataset_name: Name of the dataset (e.g., "bitmind/ffhq-256")
+        split: Dataset split to load (e.g., "train")
     """
     try:
         print(f"Loading {dataset_name} (split: {split})...")
         
-        # Use streaming mode by default to handle large datasets efficiently
-        print(f"  Using streaming mode...")
-        dataset = load_dataset(dataset_name, split=split, streaming=True)
+        # Try different path patterns for Hugging Face datasets
+        hf_paths = [
+            f"hf://datasets/{dataset_name}/data/{split}-*.parquet",
+            f"hf://datasets/{dataset_name}/{split}",
+            f"hf://datasets/{dataset_name}/data/{split}",
+        ]
         
-        # Extract image paths
+        df = None
+        for hf_path in hf_paths:
+            try:
+                print(f"  Trying path: {hf_path}")
+                df = dd.read_parquet(hf_path)
+                print(f"  ✓ Successfully loaded with path: {hf_path}")
+                break
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                continue
+        
+        if df is None:
+            raise ValueError(f"Could not load dataset {dataset_name} with any path pattern")
+        
+        # Get dataset info
+        num_partitions = df.npartitions
+        print(f"  Dataset has {num_partitions} partitions")
+        
+        # Extract image paths from Dask DataFrame
         image_paths = []
         items_processed = 0
         
-        for item in dataset:
-            processed = _extract_image_path_from_item(item)
-            if processed:
-                image_paths.append(processed)
-                items_processed += 1
+        # Iterate through partitions
+        for partition_idx in range(num_partitions):
+            partition_df = df.get_partition(partition_idx).compute()
             
-            # Print progress every 10000 items
-            if items_processed % 10000 == 0:
-                print(f"    Loaded {items_processed} images so far...")
+            for _, row in partition_df.iterrows():
+                processed = _extract_image_path_from_row(row)
+                if processed:
+                    image_paths.append(processed)
+                    items_processed += 1
+                
+                # Print progress every 10000 items
+                if items_processed % 10000 == 0:
+                    print(f"    Loaded {items_processed} images so far...")
         
         print(f"Loaded {len(image_paths)} images from {dataset_name}")
         return image_paths
     
     except Exception as e:
-        error_msg = str(e)
-        if "Decompressed Data Too Large" in error_msg or "too large" in error_msg.lower():
-            print(f"  ⚠️  Skipping {dataset_name}: Dataset too large to decompress. Consider removing from dataset list.")
-        else:
-            print(f"  ⚠️  Error loading {dataset_name}: {e}")
+        print(f"  ⚠️  Error loading {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
-def _extract_image_path_from_item(item):
-    """Extract image path from a dataset item."""
-    if isinstance(item, dict):
-        if 'image' in item:
-            # Image is already loaded as PIL Image
-            return item
-        elif 'path' in item:
-            return item['path']
-        else:
-            # Try to find image field
-            for key in ['image', 'img', 'file_path', 'file', 'path']:
-                if key in item:
-                    val = item[key]
-                    if isinstance(val, Image.Image):
-                        return item
-                    elif isinstance(val, str):
-                        return val
-            # Use the first value if it's a path-like string or PIL Image
-            first_val = list(item.values())[0]
-            if isinstance(first_val, Image.Image):
-                return item
-            elif isinstance(first_val, str):
-                return first_val
-    elif isinstance(item, Image.Image):
-        # Direct PIL Image
-        return item
-    elif isinstance(item, str):
-        # Direct path string
-        return item
+def _extract_image_path_from_row(row):
+    """Extract image path from a pandas DataFrame row."""
+    # Try common column names for image paths
+    for col_name in ['image', 'path', 'file_path', 'file', 'img', 'image_path', 'url']:
+        if col_name in row.index:
+            val = row[col_name]
+            if pd.notna(val):
+                if isinstance(val, str):
+                    return val
+                elif isinstance(val, Image.Image):
+                    return {'image': val}  # Return dict format for PIL Image
+                elif isinstance(val, dict):
+                    return val
+    
+    # Try to find any column that might contain image data
+    for col_name in row.index:
+        val = row[col_name]
+        if pd.notna(val):
+            if isinstance(val, str) and (val.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')) or '/' in val or '\\' in val):
+                return val
+            elif isinstance(val, Image.Image):
+                return {'image': val}
+            elif isinstance(val, dict):
+                return val
+    
+    # If no image path found, return None
     return None
 
 def load_all_datasets(
@@ -640,7 +660,7 @@ if __name__ == "__main__":
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Balance Classes: {args.balance}")
-    print(f"Using streaming mode for dataset loading")
+    print(f"Using Dask for dataset loading (hf:// protocol)")
     print("="*50 + "\n")
     
     main(args)

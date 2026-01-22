@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
-from datasets import load_dataset
+import dask.dataframe as dd
 from safetensors.torch import save_file
 import yaml
 
@@ -136,58 +136,90 @@ def load_hf_dataset(
     split: str = "train"
 ):
     """
-    Load video dataset from Hugging Face using streaming mode.
+    Load video dataset from Hugging Face using Dask.
     
     Args:
-        dataset_name: Name of the dataset
-        split: Dataset split to load
+        dataset_name: Name of the dataset (e.g., "bitmind/bm-eidon-video")
+        split: Dataset split to load (e.g., "train")
     """
     try:
         print(f"Loading {dataset_name} (split: {split})...")
         
-        # Use streaming mode by default to handle large datasets efficiently
-        print(f"  Using streaming mode...")
-        dataset = load_dataset(dataset_name, split=split, streaming=True)
+        # Try different path patterns for Hugging Face datasets
+        hf_paths = [
+            f"hf://datasets/{dataset_name}/data/{split}-*.parquet",
+            f"hf://datasets/{dataset_name}/{split}",
+            f"hf://datasets/{dataset_name}/data/{split}",
+        ]
         
-        # Extract video paths
+        df = None
+        for hf_path in hf_paths:
+            try:
+                print(f"  Trying path: {hf_path}")
+                df = dd.read_parquet(hf_path)
+                print(f"  ✓ Successfully loaded with path: {hf_path}")
+                break
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                continue
+        
+        if df is None:
+            raise ValueError(f"Could not load dataset {dataset_name} with any path pattern")
+        
+        # Get dataset info
+        num_partitions = df.npartitions
+        print(f"  Dataset has {num_partitions} partitions")
+        
+        # Extract video paths from Dask DataFrame
         video_paths = []
         items_processed = 0
         
-        for item in dataset:
-            processed = _extract_video_path_from_item(item)
-            if processed:
-                video_paths.append(processed)
-                items_processed += 1
+        # Iterate through partitions
+        for partition_idx in range(num_partitions):
+            partition_df = df.get_partition(partition_idx).compute()
             
-            # Print progress every 5000 items
-            if items_processed % 5000 == 0:
-                print(f"    Loaded {items_processed} videos so far...")
+            for _, row in partition_df.iterrows():
+                processed = _extract_video_path_from_row(row)
+                if processed:
+                    video_paths.append(processed)
+                    items_processed += 1
+                
+                # Print progress every 5000 items
+                if items_processed % 5000 == 0:
+                    print(f"    Loaded {items_processed} videos so far...")
         
         print(f"Loaded {len(video_paths)} videos from {dataset_name}")
         return video_paths
     
     except Exception as e:
-        error_msg = str(e)
-        if "Decompressed Data Too Large" in error_msg or "too large" in error_msg.lower():
-            print(f"  ⚠️  Skipping {dataset_name}: Dataset too large to decompress. Consider removing from dataset list.")
-        else:
-            print(f"  ⚠️  Error loading {dataset_name}: {e}")
+        print(f"  ⚠️  Error loading {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
-def _extract_video_path_from_item(item):
-    """Extract video path from a dataset item."""
-    if isinstance(item, dict):
-        # Try to find video field
-        for key in ['video', 'path', 'file', 'file_path']:
-            if key in item:
-                return item
-        # Use the first value
-        first_val = list(item.values())[0]
-        if isinstance(first_val, str):
-            return first_val
-    elif isinstance(item, str):
-        return item
+def _extract_video_path_from_row(row):
+    """Extract video path from a pandas DataFrame row."""
+    # Try common column names for video paths
+    for col_name in ['video', 'path', 'file_path', 'file', 'video_path', 'url', 'bytes']:
+        if col_name in row.index:
+            val = row[col_name]
+            if pd.notna(val):
+                if isinstance(val, str):
+                    return val
+                elif isinstance(val, dict):
+                    return val
+    
+    # Try to find any column that might contain video data
+    for col_name in row.index:
+        val = row[col_name]
+        if pd.notna(val):
+            if isinstance(val, str) and (val.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')) or '/' in val or '\\' in val):
+                return val
+            elif isinstance(val, dict):
+                return val
+    
+    # If no video path found, return None
     return None
             if isinstance(item, dict):
                 # Try to find video field
@@ -561,6 +593,8 @@ if __name__ == "__main__":
                         help="Custom list of synthetic video datasets")
     parser.add_argument("--semisynthetic-datasets", type=str, nargs="+", default=None,
                         help="Custom list of semisynthetic video datasets")
+    parser.add_argument("--max-size-mb", type=int, default=200,
+                        help="Maximum dataset size in MB before using streaming mode (default: 200, smaller for videos)")
     parser.add_argument("--balance", action="store_true", default=True,
                         help="Balance classes by taking min samples per class")
     
@@ -591,7 +625,7 @@ if __name__ == "__main__":
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Balance Classes: {args.balance}")
-    print(f"Using streaming mode for dataset loading")
+    print(f"Using Dask for dataset loading (hf:// protocol)")
     print("="*50 + "\n")
     
     main(args)

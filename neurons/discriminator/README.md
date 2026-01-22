@@ -171,8 +171,18 @@ Main dependencies:
 - safetensors (for model saving)
 - pyyaml (for config files)
 - av (for video processing)
+- dask[dataframe] (for loading Hugging Face datasets via hf:// protocol)
+- fsspec (for filesystem abstraction)
+- hf-file-system (for Hugging Face filesystem support)
 
 Most base dependencies are already in `pyproject.toml`.
+
+**Note:** You need to authenticate with Hugging Face first:
+```bash
+huggingface-cli login
+# or
+hf auth login
+```
 
 ## References
 
