@@ -181,7 +181,7 @@ def load_hf_dataset_from_parquet(
     dataset_name: str, 
     split: str = "train",
     max_samples: int = None,
-    max_parquet_files: int = 5
+    max_parquet_files: int = None
 ) -> List[Any]:
     """
     Load video dataset from Hugging Face by reading parquet files directly.
@@ -328,9 +328,9 @@ def load_all_datasets(
     real_datasets: List[str],
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
-    balance_classes: bool = True,
+    balance_classes: bool = False,
     max_samples_per_dataset: int = None,
-    max_parquet_files: int = 5
+    max_parquet_files: int = None
 ) -> Tuple[List[Any], List[int]]:
     """Load all video datasets and create labeled dataset."""
     
@@ -370,16 +370,21 @@ def load_all_datasets(
         all_data.extend(data)
         all_labels.extend([2] * len(data))
     
-    print(f"\nTotal samples: {len(all_data)}")
-    print(f"  Real: {sum(1 for l in all_labels if l == 0)}")
-    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1)}")
-    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2)}")
+    print(f"\nTotal samples loaded: {len(all_data):,}")
+    print(f"  Real: {sum(1 for l in all_labels if l == 0):,}")
+    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1):,}")
+    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2):,}")
     
     # Balance classes if requested
     if balance_classes:
         counts = [sum(1 for l in all_labels if l == i) for i in range(3)]
         min_count = min(counts)
-        print(f"\nBalancing to {min_count} samples per class...")
+        discarded = len(all_data) - (min_count * 3)
+        print(f"\n⚠️  WARNING: Balancing will reduce dataset from {len(all_data):,} to {min_count * 3:,} samples")
+        print(f"   This discards {discarded:,} samples ({100*discarded/len(all_data):.1f}% of data)!")
+        print(f"   Class counts: Real={counts[0]:,}, Synthetic={counts[1]:,}, Semi-synthetic={counts[2]:,}")
+        print(f"   Will balance to: {min_count:,} samples per class")
+        print(f"\nBalancing to {min_count:,} samples per class...")
         
         balanced_data = []
         balanced_labels = []
@@ -391,7 +396,11 @@ def load_all_datasets(
         all_data = balanced_data
         all_labels = balanced_labels
         
-        print(f"After balancing: {len(all_data)} samples")
+        print(f"After balancing: {len(all_data):,} samples")
+    else:
+        print(f"\n✓ Using ALL {len(all_data):,} samples (no balancing)")
+        counts = [sum(1 for l in all_labels if l == i) for i in range(3)]
+        print(f"   Class distribution: Real={counts[0]:,}, Synthetic={counts[1]:,}, Semi-synthetic={counts[2]:,}")
     
     return all_data, all_labels
 
@@ -405,13 +414,27 @@ def train_model(
     num_epochs: int,
     learning_rate: float,
     output_dir: Path,
-    device: torch.device
+    device: torch.device,
+    use_amp: bool = True,
+    compile_model: bool = True
 ):
-    """Train the model."""
+    """Train the model with optimizations for large GPU."""
     
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    # Mixed precision training (FP16/BF16) - uses more VRAM and speeds up training
+    scaler = torch.cuda.amp.GradScaler() if use_amp and device.type == 'cuda' else None
+    
+    # Compile model for faster training (PyTorch 2.0+)
+    if compile_model and hasattr(torch, 'compile') and device.type == 'cuda':
+        try:
+            print("Compiling model for faster training...")
+            model = torch.compile(model, mode='reduce-overhead')
+            print("✓ Model compiled successfully")
+        except Exception as e:
+            print(f"⚠️  Model compilation failed: {e}, continuing without compilation")
     
     best_val_acc = 0.0
     train_losses = []
@@ -428,14 +451,28 @@ def train_model(
         
         for batch_idx, (data, target) in enumerate(train_loader):
             # data shape: [B, T, C, H, W] -> convert to [B, C, T, H, W] for Conv3d
-            data = data.permute(0, 2, 1, 3, 4).to(device)
-            target = target.to(device)
+            data = data.permute(0, 2, 1, 3, 4).to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             
             optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+            
+            # Mixed precision training
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    output = model(data)
+                    loss = criterion(output, target)
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             
             train_loss += loss.item()
             pred = output.argmax(dim=1)
@@ -443,8 +480,16 @@ def train_model(
             train_total += target.size(0)
             
             if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
-                      f"Loss: {loss.item():.4f}")
+                # Show GPU memory usage
+                if device.type == 'cuda':
+                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                          f"Loss: {loss.item():.4f}, "
+                          f"VRAM: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB")
+                else:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                          f"Loss: {loss.item():.4f}")
         
         train_acc = 100. * train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
@@ -459,10 +504,16 @@ def train_model(
         
         with torch.no_grad():
             for data, target in val_loader:
-                data = data.permute(0, 2, 1, 3, 4).to(device)
-                target = target.to(device)
-                output = model(data)
-                loss = criterion(output, target)
+                data = data.permute(0, 2, 1, 3, 4).to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        output = model(data)
+                        loss = criterion(output, target)
+                else:
+                    output = model(data)
+                    loss = criterion(output, target)
                 
                 val_loss += loss.item()
                 pred = output.argmax(dim=1)
@@ -613,20 +664,48 @@ def main(args):
     train_dataset = VideoDataset(train_data, train_labels, img_size, args.num_frames)
     val_dataset = VideoDataset(val_data, val_labels, img_size, args.num_frames)
     
-    # Create data loaders
+    # Create data loaders with optimizations
+    use_cuda = torch.cuda.is_available()
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True if torch.cuda.is_available() else False
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        num_workers=args.num_workers, 
+        pin_memory=use_cuda,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+        drop_last=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True if torch.cuda.is_available() else False
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        num_workers=args.num_workers, 
+        pin_memory=use_cuda,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None
     )
     
     # Create model
     model = VideoELAPRNUDetector(num_classes=3, input_channels=4, num_frames=args.num_frames).to(device)
     print(f"\nModel created on {device}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Estimate memory usage and suggest batch size
+    if torch.cuda.is_available():
+        # Estimate memory per sample (num_frames * 4 channels, 256x256)
+        img_size = args.img_size[0] * args.img_size[1]
+        bytes_per_sample = args.num_frames * img_size * 4 * 4  # num_frames * 4 channels * 4 bytes (float32)
+        estimated_batch_memory = args.batch_size * bytes_per_sample / (1024**3)  # GB
+        
+        print(f"\nEstimated memory per batch: ~{estimated_batch_memory:.2f} GB")
+        print(f"Current batch size: {args.batch_size}")
+        
+        # Suggest larger batch size for 80GB GPU
+        if torch.cuda.get_device_properties(0).total_memory > 70 * 1024**3:  # > 70GB
+            suggested_batch = min(128, int(80 / estimated_batch_memory * args.batch_size))
+            if suggested_batch > args.batch_size:
+                print(f"💡 Suggestion: For 80GB GPU, try --batch-size {suggested_batch} to use more VRAM")
     
     # Train
     print("\n" + "="*50)
@@ -638,7 +717,9 @@ def main(args):
         num_epochs=args.epochs,
         learning_rate=args.lr,
         output_dir=output_dir,
-        device=device
+        device=device,
+        use_amp=args.use_amp,
+        compile_model=args.compile_model
     )
     
     # Evaluate
@@ -700,21 +781,31 @@ if __name__ == "__main__":
                         help="Custom list of synthetic video datasets")
     parser.add_argument("--semisynthetic-datasets", type=str, nargs="+", default=None,
                         help="Custom list of semisynthetic video datasets")
-    parser.add_argument("--balance", action="store_true", default=True,
-                        help="Balance classes by taking min samples per class")
+    parser.add_argument("--balance", action="store_true", default=False,
+                        help="Balance classes by taking min samples per class (WARNING: discards data, default: False)")
     parser.add_argument("--max-samples-per-dataset", type=int, default=None,
-                        help="Maximum samples to load per dataset (None for all)")
-    parser.add_argument("--max-parquet-files", type=int, default=5,
-                        help="Maximum parquet files to process per dataset")
+                        help="Maximum samples to load per dataset (None for all, default: None = ALL)")
+    parser.add_argument("--max-parquet-files", type=int, default=None,
+                        help="Maximum parquet files to process per dataset (None for all, default: None = ALL)")
     
     # Training arguments
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size (smaller for videos)")
+    parser.add_argument("--batch-size", type=int, default=32, 
+                        help="Batch size (default: 32 for videos on large GPU, increase for 80GB GPU)")
     parser.add_argument("--img-size", type=int, nargs=2, default=[256, 256],
                         help="Frame size (width height)")
     parser.add_argument("--num-frames", type=int, default=8, help="Number of frames per video")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (fewer for videos)")
+    parser.add_argument("--num-workers", type=int, default=8, 
+                        help="DataLoader workers (default: 8, increase for faster data loading)")
+    parser.add_argument("--use-amp", action="store_true", default=True,
+                        help="Use Automatic Mixed Precision (FP16) for faster training and more VRAM usage")
+    parser.add_argument("--no-amp", dest="use_amp", action="store_false",
+                        help="Disable Automatic Mixed Precision")
+    parser.add_argument("--compile-model", action="store_true", default=True,
+                        help="Compile model with torch.compile for faster training (PyTorch 2.0+)")
+    parser.add_argument("--no-compile", dest="compile_model", action="store_false",
+                        help="Disable model compilation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Model arguments
@@ -730,11 +821,23 @@ if __name__ == "__main__":
     print("="*50)
     print(f"Frame Size: {args.img_size[0]}x{args.img_size[1]}")
     print(f"Number of Frames: {args.num_frames}")
-    print(f"Batch Size: {args.batch_size}")
+    print(f"Batch Size: {args.batch_size} (adjust for your GPU VRAM)")
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
-    print(f"Balance Classes: {args.balance}")
+    print(f"DataLoader Workers: {args.num_workers}")
+    print(f"Mixed Precision (AMP): {args.use_amp} {'✓' if args.use_amp else '✗'}")
+    print(f"Model Compilation: {args.compile_model} {'✓' if args.compile_model else '✗'}")
+    print(f"Balance Classes: {args.balance} {'⚠️  (WILL DISCARD DATA!)' if args.balance else '✓ (using all data)'}")
+    print(f"Max Parquet Files per Dataset: {args.max_parquet_files if args.max_parquet_files else 'ALL ✓'}")
+    print(f"Max Samples per Dataset: {args.max_samples_per_dataset if args.max_samples_per_dataset else 'ALL ✓'}")
     print(f"Using PyTorch DataLoader with direct parquet file reading")
+    
+    # Print GPU info
+    if torch.cuda.is_available():
+        print(f"\nGPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(f"Current VRAM usage: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    
     print("="*50 + "\n")
     
     main(args)
