@@ -303,6 +303,7 @@ def load_hf_dataset_from_parquet(
         
         image_data = []
         count = 0
+        accumulated_chunk = []  # Accumulate images across multiple parquet files
         
         # Process each parquet file
         for parquet_file in parquet_files:
@@ -320,10 +321,10 @@ def load_hf_dataset_from_parquet(
                         repo_type="dataset"
                     )
                     
-                    # Read parquet file in chunks for better memory efficiency
+                    # Read parquet file
                     parquet_file_obj = pq.ParquetFile(tmp_path)
                     total_rows = parquet_file_obj.metadata.num_rows
-                    print(f"    Parquet file has {total_rows:,} rows, processing in chunks of {chunk_size:,}...")
+                    print(f"    Parquet file has {total_rows:,} rows")
                     
                     # Find image column from first batch
                     first_batch = parquet_file_obj.read_row_groups([0], columns=None)
@@ -346,61 +347,56 @@ def load_hf_dataset_from_parquet(
                         print(f"    ⚠️  No image column found in {parquet_file}")
                         continue
                     
-                    # Process parquet file in chunks
-                    num_row_groups = parquet_file_obj.num_row_groups
-                    images_from_file = 0
+                    # Process entire parquet file at once (it's already small at 10k rows)
+                    table = pq.read_table(tmp_path, columns=[image_col])
+                    df = table.to_pandas()
                     
-                    for rg_idx in range(num_row_groups):
+                    # Extract images from this parquet file
+                    images_from_file = 0
+                    for _, row in df.iterrows():
                         if max_samples and count >= max_samples:
                             break
                         
-                        # Read chunk (row group)
-                        batch = parquet_file_obj.read_row_groups([rg_idx], columns=[image_col])
-                        chunk_df = batch.to_pandas()
-                        
-                        # Process chunk
-                        chunk_data = []
-                        for _, row in chunk_df.iterrows():
-                            if max_samples and count >= max_samples:
-                                break
+                        try:
+                            img_data = row[image_col]
                             
-                            try:
-                                img_data = row[image_col]
-                                
-                                if pd.isna(img_data) or img_data is None:
-                                    continue
-                                
-                                # Handle different data types
-                                if isinstance(img_data, Image.Image):
-                                    chunk_data.append(img_data)
-                                    count += 1
-                                elif isinstance(img_data, (bytes, bytearray)):
-                                    chunk_data.append(img_data)
-                                    count += 1
-                                elif isinstance(img_data, str):
-                                    # Could be path or base64
-                                    chunk_data.append(img_data)
-                                    count += 1
-                                elif isinstance(img_data, dict):
-                                    # Extract bytes or image from dict
-                                    for key in ['bytes', 'image', 'data', 'content']:
-                                        if key in img_data:
-                                            chunk_data.append(img_data[key])
-                                            count += 1
-                                            break
-                            
-                            except Exception as e:
+                            if pd.isna(img_data) or img_data is None:
                                 continue
+                            
+                            # Handle different data types
+                            if isinstance(img_data, Image.Image):
+                                accumulated_chunk.append(img_data)
+                                count += 1
+                                images_from_file += 1
+                            elif isinstance(img_data, (bytes, bytearray)):
+                                accumulated_chunk.append(img_data)
+                                count += 1
+                                images_from_file += 1
+                            elif isinstance(img_data, str):
+                                # Could be path or base64
+                                accumulated_chunk.append(img_data)
+                                count += 1
+                                images_from_file += 1
+                            elif isinstance(img_data, dict):
+                                # Extract bytes or image from dict
+                                for key in ['bytes', 'image', 'data', 'content']:
+                                    if key in img_data:
+                                        accumulated_chunk.append(img_data[key])
+                                        count += 1
+                                        images_from_file += 1
+                                        break
                         
-                        # Add chunk to main list
-                        image_data.extend(chunk_data)
-                        images_from_file += len(chunk_data)
-                        
-                        # Progress update
-                        if count % chunk_size == 0:
-                            print(f"    Loaded {count:,} images so far...")
+                        except Exception as e:
+                            continue
                     
-                    print(f"    Loaded {images_from_file:,} images from {parquet_file}")
+                    print(f"    Loaded {images_from_file:,} images from {parquet_file} (accumulated: {len(accumulated_chunk):,})")
+                    
+                    # When accumulated chunk reaches chunk_size, add to main list and clear
+                    if len(accumulated_chunk) >= chunk_size:
+                        print(f"    → Flushing chunk of {len(accumulated_chunk):,} images to main list...")
+                        image_data.extend(accumulated_chunk)
+                        accumulated_chunk = []
+                        print(f"    Total loaded so far: {len(image_data):,} images")
                 
                 except Exception as e:
                     print(f"    ⚠️  Error reading parquet: {e}")
@@ -410,7 +406,13 @@ def load_hf_dataset_from_parquet(
                 print(f"    ⚠️  Error processing {parquet_file}: {e}")
                 continue
         
-        print(f"Loaded {len(image_data)} total images from {dataset_name}")
+        # Add any remaining accumulated images
+        if accumulated_chunk:
+            print(f"    → Flushing final chunk of {len(accumulated_chunk):,} images...")
+            image_data.extend(accumulated_chunk)
+            accumulated_chunk = []
+        
+        print(f"Loaded {len(image_data):,} total images from {dataset_name}")
         return image_data
     
     except Exception as e:
