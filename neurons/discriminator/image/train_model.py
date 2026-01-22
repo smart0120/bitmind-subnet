@@ -245,7 +245,8 @@ def load_hf_dataset_from_parquet(
     dataset_name: str, 
     split: str = "train",
     max_samples: int = None,
-    max_parquet_files: int = None
+    max_parquet_files: int = None,
+    chunk_size: int = 100000
 ) -> List[Any]:
     """
     Load dataset from Hugging Face by reading parquet files directly.
@@ -319,20 +320,24 @@ def load_hf_dataset_from_parquet(
                         repo_type="dataset"
                     )
                     
-                    # Read parquet file
-                    table = pq.read_table(tmp_path)
-                    df = table.to_pandas()
+                    # Read parquet file in chunks for better memory efficiency
+                    parquet_file_obj = pq.ParquetFile(tmp_path)
+                    total_rows = parquet_file_obj.metadata.num_rows
+                    print(f"    Parquet file has {total_rows:,} rows, processing in chunks of {chunk_size:,}...")
                     
-                    # Find image column
+                    # Find image column from first batch
+                    first_batch = parquet_file_obj.read_row_groups([0], columns=None)
+                    first_df = first_batch.to_pandas()
+                    
                     image_col = None
                     for col in ['image', 'path', 'file_path', 'file', 'img', 'image_path', 'url']:
-                        if col in df.columns:
+                        if col in first_df.columns:
                             image_col = col
                             break
                     
                     if image_col is None:
                         # Try to find any column with image-like data
-                        for col in df.columns:
+                        for col in first_df.columns:
                             if 'image' in col.lower() and '_id' not in col.lower():
                                 image_col = col
                                 break
@@ -341,43 +346,61 @@ def load_hf_dataset_from_parquet(
                         print(f"    ⚠️  No image column found in {parquet_file}")
                         continue
                     
-                    # Extract image data
-                    for _, row in df.iterrows():
+                    # Process parquet file in chunks
+                    num_row_groups = parquet_file_obj.num_row_groups
+                    images_from_file = 0
+                    
+                    for rg_idx in range(num_row_groups):
                         if max_samples and count >= max_samples:
                             break
                         
-                        try:
-                            img_data = row[image_col]
-                            
-                            if pd.isna(img_data) or img_data is None:
-                                continue
-                            
-                            # Handle different data types
-                            if isinstance(img_data, Image.Image):
-                                image_data.append(img_data)
-                                count += 1
-                            elif isinstance(img_data, (bytes, bytearray)):
-                                image_data.append(img_data)
-                                count += 1
-                            elif isinstance(img_data, str):
-                                # Could be path or base64
-                                image_data.append(img_data)
-                                count += 1
-                            elif isinstance(img_data, dict):
-                                # Extract bytes or image from dict
-                                for key in ['bytes', 'image', 'data', 'content']:
-                                    if key in img_data:
-                                        image_data.append(img_data[key])
-                                        count += 1
-                                        break
-                            
-                            if count % 100000 == 0:
-                                print(f"    Loaded {count} images so far...")
+                        # Read chunk (row group)
+                        batch = parquet_file_obj.read_row_groups([rg_idx], columns=[image_col])
+                        chunk_df = batch.to_pandas()
                         
-                        except Exception as e:
-                            continue
+                        # Process chunk
+                        chunk_data = []
+                        for _, row in chunk_df.iterrows():
+                            if max_samples and count >= max_samples:
+                                break
+                            
+                            try:
+                                img_data = row[image_col]
+                                
+                                if pd.isna(img_data) or img_data is None:
+                                    continue
+                                
+                                # Handle different data types
+                                if isinstance(img_data, Image.Image):
+                                    chunk_data.append(img_data)
+                                    count += 1
+                                elif isinstance(img_data, (bytes, bytearray)):
+                                    chunk_data.append(img_data)
+                                    count += 1
+                                elif isinstance(img_data, str):
+                                    # Could be path or base64
+                                    chunk_data.append(img_data)
+                                    count += 1
+                                elif isinstance(img_data, dict):
+                                    # Extract bytes or image from dict
+                                    for key in ['bytes', 'image', 'data', 'content']:
+                                        if key in img_data:
+                                            chunk_data.append(img_data[key])
+                                            count += 1
+                                            break
+                            
+                            except Exception as e:
+                                continue
+                        
+                        # Add chunk to main list
+                        image_data.extend(chunk_data)
+                        images_from_file += len(chunk_data)
+                        
+                        # Progress update
+                        if count % chunk_size == 0:
+                            print(f"    Loaded {count:,} images so far...")
                     
-                    print(f"    Loaded {len(image_data) - (count - df.shape[0])} images from {parquet_file}")
+                    print(f"    Loaded {images_from_file:,} images from {parquet_file}")
                 
                 except Exception as e:
                     print(f"    ⚠️  Error reading parquet: {e}")
@@ -403,7 +426,8 @@ def load_all_datasets(
     semisynthetic_datasets: List[str],
     balance_classes: bool = False,
     max_samples_per_dataset: int = None,
-    max_parquet_files: int = None
+    max_parquet_files: int = None,
+    chunk_size: int = 100000
 ) -> Tuple[List[Any], List[int]]:
     """Load all datasets and create labeled dataset."""
     
@@ -416,7 +440,8 @@ def load_all_datasets(
         data = load_hf_dataset_from_parquet(
             ds_name, split="train", 
             max_samples=max_samples_per_dataset,
-            max_parquet_files=max_parquet_files
+            max_parquet_files=max_parquet_files,
+            chunk_size=chunk_size
         )
         all_data.extend(data)
         all_labels.extend([0] * len(data))
@@ -755,7 +780,8 @@ def main(args):
         semisynthetic_datasets=SEMISYNTHETIC_DATASETS if not args.semisynthetic_datasets else args.semisynthetic_datasets,
         balance_classes=args.balance,
         max_samples_per_dataset=args.max_samples_per_dataset,
-        max_parquet_files=args.max_parquet_files
+        max_parquet_files=args.max_parquet_files,
+        chunk_size=args.chunk_size
     )
     
     if len(all_data) == 0:
@@ -939,6 +965,7 @@ if __name__ == "__main__":
     print(f"Balance Classes: {args.balance} {'⚠️  (WILL DISCARD DATA!)' if args.balance else '✓ (using all data)'}")
     print(f"Max Parquet Files per Dataset: {args.max_parquet_files if args.max_parquet_files else 'ALL ✓'}")
     print(f"Max Samples per Dataset: {args.max_samples_per_dataset if args.max_samples_per_dataset else 'ALL ✓'}")
+    print(f"Chunk Size (images per batch): {args.chunk_size:,}")
     print(f"Using PyTorch DataLoader with direct parquet file reading")
     
     # Print GPU info
