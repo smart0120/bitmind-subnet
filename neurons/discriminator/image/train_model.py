@@ -325,7 +325,7 @@ def load_hf_dataset_from_parquet(
                     
                     # Find image column
                     image_col = None
-                    for col in ['image', 'path', 'file_path', 'file', 'img', 'image_path']:
+                    for col in ['image', 'path', 'file_path', 'file', 'img', 'image_path', 'url']:
                         if col in df.columns:
                             image_col = col
                             break
