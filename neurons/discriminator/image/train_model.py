@@ -319,7 +319,8 @@ def download_dataset_to_disk(
     max_images_per_file: Optional[int] = None,
     tracker: Optional[DownloadTracker] = None,
     force_download: bool = False,
-    max_workers: int = 4  # Number of parallel download/extraction workers
+    max_workers: int = 4,  # Number of parallel download/extraction workers
+    extraction_batch_size: int = 10000  # Number of rows to process per batch during extraction
 ) -> List[str]:
     """
     Download dataset to disk and extract images with tracking.
@@ -415,95 +416,103 @@ def download_dataset_to_disk(
             image_paths = tracker.get_image_paths(dataset_name, output_dir)
             print(f"  ✓ Using {len(image_paths)} images from previously downloaded files")
         
-        # Download and extract remaining files
+        # Download and extract remaining files using pipeline approach
         if files_to_download:
-            print(f"  Downloading {len(files_to_download)} new files (using {max_workers} parallel workers)...")
+            print(f"  Downloading and extracting {len(files_to_download)} new files (using {max_workers} parallel workers, pipeline mode)...")
             
             # Get download URLs using the private function
             remote_paths = download_module._get_download_urls(dataset_name, files_to_download)
             
-            # Download files in parallel
-            downloaded_files = download_files_parallel(remote_paths, output_dir, max_workers=max_workers)
+            # Pipeline: Download and extract simultaneously
+            # While extracting file N, download file N+1
+            image_paths_lock = Lock()
             
-            if not downloaded_files:
-                print(f"  ⚠️  Failed to download any files for {dataset_name}")
-            else:
-                # Extract images from downloaded files in parallel
-                image_paths_lock = Lock()
+            def download_and_extract_pipeline(url, filename):
+                """Download a file and immediately extract images from it."""
+                file_name = filename
+                file_image_paths = []
+                batch_size = extraction_batch_size  # Use configurable batch size
                 
-                def extract_from_file(source_file):
-                    """Extract images from a single file."""
-                    file_name = source_file.name
-                    file_image_paths = []
+                try:
+                    # Download the file
+                    filepath = output_dir / file_name
                     
-                    # Mark as downloading
+                    # Skip if already exists
+                    if not filepath.exists():
+                        try:
+                            resp = requests.get(url, stream=True, timeout=3600)
+                            if resp.status_code != 200:
+                                return (file_name, 0, [], f"Download failed: Status {resp.status_code}")
+                            
+                            with open(filepath, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                        except Exception as e:
+                            return (file_name, 0, [], f"Download error: {str(e)}")
+                    
+                    # Mark as downloading in tracker
                     tracker.mark_downloading(
                         dataset_name, file_name, detected_format, str(output_dir)
                     )
                     
-                    try:
-                        num_items = max_images_per_file if max_images_per_file else None  # None = all
-                        count = 0
-                        extracted_any = False
-                        
-                        # Try to extract images
-                        for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items or 10000):
-                            extracted_any = True
-                            # Save image to disk
-                            if isinstance(media_obj, Image.Image):
-                                # Generate unique filename
-                                img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
-                                img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
+                    # Immediately extract images from downloaded file
+                    num_items = max_images_per_file if max_images_per_file else None
+                    count = 0
+                    extracted_any = False
+                    
+                    # Try to extract images using standard method
+                    for media_obj, metadata in yield_media_from_source(filepath, dataset_config, num_items or 10000):
+                        extracted_any = True
+                        if isinstance(media_obj, Image.Image):
+                            img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
+                            img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
+                            
+                            if media_obj.mode != 'RGB':
+                                media_obj = media_obj.convert('RGB')
+                            media_obj.save(img_path, 'JPEG', quality=95)
+                            file_image_paths.append(str(img_path))
+                            count += 1
+                    
+                    # If standard extraction failed, try alternative method
+                    if not extracted_any or count == 0:
+                        if detected_format == "parquet" and filepath.exists():
+                            try:
+                                import pyarrow.parquet as pq
+                                import pandas as pd
                                 
-                                # Convert to RGB and save
-                                if media_obj.mode != 'RGB':
-                                    media_obj = media_obj.convert('RGB')
-                                media_obj.save(img_path, 'JPEG', quality=95)
-                                file_image_paths.append(str(img_path))
-                                count += 1
-                        
-                        # If no images were extracted, try alternative extraction methods
-                        if not extracted_any or count == 0:
-                            # Try direct parquet reading with better column detection
-                            if detected_format == "parquet" and source_file.exists():
-                                try:
-                                    import pyarrow.parquet as pq
-                                    import pandas as pd
-                                    
-                                    table = pq.read_table(source_file)
-                                    df = table.to_pandas()
-                                    
-                                    # Debug: Print available columns
-                                    print(f"    Debug: {file_name} has columns: {list(df.columns)}")
-                                    print(f"    Debug: {file_name} has {len(df)} rows")
-                                    
-                                    # Try multiple column name patterns
-                                    possible_cols = []
+                                table = pq.read_table(filepath)
+                                df = table.to_pandas()
+                                
+                                # Find image column (same logic as before)
+                                possible_cols = []
+                                for col in df.columns:
+                                    col_lower = col.lower()
+                                    if any(keyword in col_lower for keyword in ['image', 'img', 'bytes', 'data', 'content', 'file', 'path', 'url']):
+                                        if '_id' not in col_lower and 'width' not in col_lower and 'height' not in col_lower:
+                                            possible_cols.append(col)
+                                
+                                if not possible_cols:
                                     for col in df.columns:
-                                        col_lower = col.lower()
-                                        if any(keyword in col_lower for keyword in ['image', 'img', 'bytes', 'data', 'content', 'file', 'path', 'url']):
-                                            if '_id' not in col_lower and 'width' not in col_lower and 'height' not in col_lower:
-                                                possible_cols.append(col)
+                                        if df[col].dtype == 'object':
+                                            sample_val = df[col].iloc[0] if len(df) > 0 else None
+                                            if sample_val is not None:
+                                                if isinstance(sample_val, (bytes, str)) or (isinstance(sample_val, dict) and any(k in str(sample_val).lower() for k in ['bytes', 'image', 'data'])):
+                                                    possible_cols.append(col)
+                                
+                                # Extract from first working column with batch processing
+                                for col in possible_cols[:3]:
+                                    if count >= (num_items or 10000):
+                                        break
                                     
-                                    if not possible_cols:
-                                        # Try all columns that might contain binary data or paths
-                                        for col in df.columns:
-                                            if df[col].dtype == 'object':
-                                                # Check if column might contain image data
-                                                sample_val = df[col].iloc[0] if len(df) > 0 else None
-                                                if sample_val is not None:
-                                                    if isinstance(sample_val, (bytes, str)) or (isinstance(sample_val, dict) and any(k in str(sample_val).lower() for k in ['bytes', 'image', 'data'])):
-                                                        possible_cols.append(col)
+                                    max_rows = min(len(df), num_items or 10000)
                                     
-                                    print(f"    Debug: Trying columns: {possible_cols[:5]}")
-                                    
-                                    # Try to extract from each possible column
-                                    for col in possible_cols[:5]:  # Try first 5 columns
-                                        if count >= (num_items or 10000):
-                                            break
+                                    # Process rows in batches
+                                    for batch_start in range(0, max_rows, batch_size):
+                                        batch_end = min(batch_start + batch_size, max_rows)
+                                        batch_df = df.iloc[batch_start:batch_end]
                                         
-                                        col_success = 0
-                                        for idx, row in df.iterrows():
+                                        for idx, (_, row) in enumerate(batch_df.iterrows(), start=batch_start):
                                             if count >= (num_items or 10000):
                                                 break
                                             
@@ -512,7 +521,6 @@ def download_dataset_to_disk(
                                                 if media_data is None or (isinstance(media_data, float) and np.isnan(media_data)):
                                                     continue
                                                 
-                                                # Try different formats
                                                 img = None
                                                 if isinstance(media_data, bytes):
                                                     try:
@@ -520,24 +528,17 @@ def download_dataset_to_disk(
                                                     except:
                                                         pass
                                                 elif isinstance(media_data, str):
-                                                    # Try base64 decode
                                                     try:
                                                         decoded = base64.b64decode(media_data)
                                                         img = Image.open(BytesIO(decoded))
                                                     except:
-                                                        # Try as file path or URL
-                                                        try:
-                                                            if media_data.startswith('http'):
-                                                                # Download from URL
-                                                                resp = requests.get(media_data, timeout=10)
-                                                                if resp.status_code == 200:
-                                                                    img = Image.open(BytesIO(resp.content))
-                                                            elif Path(media_data).exists():
-                                                                img = Image.open(media_data)
-                                                        except:
-                                                            pass
+                                                        if media_data.startswith('http'):
+                                                            resp = requests.get(media_data, timeout=10)
+                                                            if resp.status_code == 200:
+                                                                img = Image.open(BytesIO(resp.content))
+                                                        elif Path(media_data).exists():
+                                                            img = Image.open(media_data)
                                                 elif isinstance(media_data, dict):
-                                                    # Try to find image data in dict
                                                     for key in ['bytes', 'data', 'content', 'image', 'path', 'url']:
                                                         if key in media_data:
                                                             try:
@@ -557,64 +558,62 @@ def download_dataset_to_disk(
                                                                 continue
                                                 
                                                 if img:
-                                                    # Generate unique filename
-                                                    img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
+                                                    img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{idx}_{time.time()}".encode()).hexdigest()[:8]
                                                     img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
                                                     
-                                                    # Convert to RGB and save
                                                     if img.mode != 'RGB':
                                                         img = img.convert('RGB')
                                                     img.save(img_path, 'JPEG', quality=95)
                                                     file_image_paths.append(str(img_path))
                                                     count += 1
-                                                    col_success += 1
                                                     
                                                     if count % 100 == 0:
-                                                        print(f"    Extracted {count} images from {file_name} (column: {col})...")
-                                                    
-                                            except Exception as e:
+                                                        print(f"    Extracted {count} images from {file_name} (column: {col}, batch: {batch_start//batch_size + 1})...")
+                                            except:
                                                 continue
                                         
-                                        if col_success > 0:
-                                            print(f"    ✓ Successfully extracted {col_success} images from column '{col}' in {file_name}")
-                                            break  # Found working column
+                                        if count >= (num_items or 10000):
+                                            break
                                     
-                                except Exception as e:
-                                    error_msg = f"Alternative extraction failed: {str(e)}"
-                                    if count == 0:
-                                        tracker.mark_failed(dataset_name, file_name, error_msg)
-                                        return (file_name, 0, [], error_msg)
-                        
-                        # Mark as completed in database
-                        if count > 0:
-                            tracker.mark_completed(dataset_name, file_name, count)
-                            return (file_name, count, file_image_paths, None)
-                        else:
-                            error_msg = f"No images extracted - parquet file may not contain image data or column not found"
-                            tracker.mark_failed(dataset_name, file_name, error_msg)
-                            return (file_name, 0, [], error_msg)
-                        
-                    except Exception as e:
-                        error_msg = str(e)
+                                    if count > 0:
+                                        break
+                            except Exception as e:
+                                if count == 0:
+                                    return (file_name, 0, [], f"Alternative extraction failed: {str(e)}")
+                    
+                    # Mark as completed
+                    if count > 0:
+                        tracker.mark_completed(dataset_name, file_name, count)
+                        return (file_name, count, file_image_paths, None)
+                    else:
+                        error_msg = f"No images extracted - parquet file may not contain image data"
                         tracker.mark_failed(dataset_name, file_name, error_msg)
                         return (file_name, 0, [], error_msg)
-                
-                # Process files in parallel
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(extract_from_file, source_file): source_file 
-                              for source_file in downloaded_files}
-                    
-                    completed = 0
-                    for future in as_completed(futures):
-                        completed += 1
-                        file_name, count, file_image_paths, error = future.result()
                         
-                        if error:
-                            print(f"    ✗ [{completed}/{len(downloaded_files)}] Failed {file_name}: {error}")
-                        else:
-                            with image_paths_lock:
-                                image_paths.extend(file_image_paths)
-                            print(f"    ✓ [{completed}/{len(downloaded_files)}] Extracted {count} images from {file_name}")
+                except Exception as e:
+                    error_msg = str(e)
+                    tracker.mark_failed(dataset_name, file_name, error_msg)
+                    return (file_name, 0, [], error_msg)
+            
+            # Process files in pipeline: download and extract simultaneously
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(download_and_extract_pipeline, url, os.path.basename(url)): url 
+                          for url in remote_paths}
+                
+                completed = 0
+                for future in as_completed(futures):
+                    completed += 1
+                    file_name, count, file_image_paths, error = future.result()
+                    
+                    if error:
+                        print(f"    ✗ [{completed}/{len(remote_paths)}] Failed {file_name}: {error}")
+                    else:
+                        with image_paths_lock:
+                            image_paths.extend(file_image_paths)
+                        print(f"    ✓ [{completed}/{len(remote_paths)}] Downloaded and extracted {count} images from {file_name}")
+            
+            if not image_paths:
+                print(f"  ⚠️  Failed to extract any images from {dataset_name}")
         
         print(f"  ✓ Total {len(image_paths)} images available for {dataset_name}")
         return image_paths
@@ -844,7 +843,8 @@ def load_all_datasets(
     cache_dir: Optional[str] = None,
     use_disk_cache: bool = True,
     force_download: bool = False,
-    download_workers: int = 4
+    download_workers: int = 4,
+    extraction_batch_size: int = 10000
 ) -> Tuple[List[str], List[int]]:
     """
     Load all datasets and create labeled dataset.
@@ -916,7 +916,8 @@ def load_all_datasets(
                             max_images_per_file=None,
                             tracker=tracker,
                             force_download=False,
-                            max_workers=download_workers
+                            max_workers=download_workers,
+                            extraction_batch_size=extraction_batch_size
                         )
                 else:
                     # Not in database, download
@@ -926,7 +927,8 @@ def load_all_datasets(
                         max_images_per_file=None,
                         tracker=tracker,
                         force_download=False,
-                        max_workers=args.download_workers
+                        max_workers=download_workers,
+                        extraction_batch_size=extraction_batch_size
                     )
             else:
                 # Force download or directory doesn't exist
@@ -943,7 +945,8 @@ def load_all_datasets(
                     max_images_per_file=None,
                     tracker=tracker,
                     force_download=force_download,
-                    max_workers=download_workers
+                    max_workers=download_workers,
+                    extraction_batch_size=extraction_batch_size
                 )
         else:
             # Original in-memory loading
@@ -1002,7 +1005,8 @@ def load_all_datasets(
                         max_images_per_file=None,
                         tracker=tracker,
                         force_download=False,
-                        max_workers=args.download_workers
+                        max_workers=download_workers,
+                        extraction_batch_size=extraction_batch_size
                     )
             else:
                 # Force download or directory doesn't exist
@@ -1019,7 +1023,8 @@ def load_all_datasets(
                     max_images_per_file=None,
                     tracker=tracker,
                     force_download=force_download,
-                    max_workers=download_workers
+                    max_workers=download_workers,
+                    extraction_batch_size=extraction_batch_size
                 )
         else:
             # Original in-memory loading
@@ -1078,7 +1083,8 @@ def load_all_datasets(
                         max_images_per_file=None,
                         tracker=tracker,
                         force_download=False,
-                        max_workers=args.download_workers
+                        max_workers=download_workers,
+                        extraction_batch_size=extraction_batch_size
                     )
             else:
                 # Force download or directory doesn't exist
@@ -1095,7 +1101,8 @@ def load_all_datasets(
                     max_images_per_file=None,
                     tracker=tracker,
                     force_download=force_download,
-                    max_workers=download_workers
+                    max_workers=download_workers,
+                    extraction_batch_size=extraction_batch_size
                 )
         else:
             # Original in-memory loading
@@ -1469,7 +1476,8 @@ def main(args):
         cache_dir=args.cache_dir,
         use_disk_cache=args.use_disk_cache,
         force_download=args.force_download,
-        download_workers=args.download_workers
+        download_workers=args.download_workers,
+        extraction_batch_size=args.extraction_batch_size
     )
     
     if len(all_paths) == 0:
@@ -1641,6 +1649,8 @@ if __name__ == "__main__":
                         help="Force re-download of datasets even if cached files exist (default: False, uses existing cache)")
     parser.add_argument("--download-workers", type=int, default=4,
                         help="Number of parallel workers for downloading and extracting (default: 4, increase for faster downloads)")
+    parser.add_argument("--extraction-batch-size", type=int, default=10000,
+                        help="Number of rows to process per batch during parquet extraction (default: 10000, increase for faster processing, decrease if memory issues)")
     
     args = parser.parse_args()
     
@@ -1667,6 +1677,7 @@ if __name__ == "__main__":
         print(f"Cache Directory: {cache_path.resolve()}")
         print(f"Force Download: {'✓ Enabled (will re-download)' if args.force_download else '✗ Disabled (will use existing cache)'}")
         print(f"Download Workers: {args.download_workers} (parallel downloads/extraction)")
+        print(f"Extraction Batch Size: {args.extraction_batch_size} rows per batch")
     
     # Show GPU info
     if torch.cuda.is_available():
