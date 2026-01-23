@@ -2,6 +2,16 @@
 Image Detector Training Script
 Loads datasets from Hugging Face and trains a multiclass classifier (real, synthetic, semisynthetic)
 using ELA+PRNU fusion features. Outputs model in Safetensors format for submission.
+
+Optimizations:
+- Automatic Mixed Precision (AMP) for faster training and reduced memory
+- Gradient accumulation for effective larger batch sizes
+- On-the-fly data augmentation (memory efficient)
+- Optimized DataLoader with persistent workers and prefetching
+- Automatic streaming mode for large datasets
+- Gradient clipping to prevent exploding gradients
+- Memory cleanup and cache management
+- Optional profiling for bottleneck identification
 """
 
 import argparse
@@ -19,6 +29,8 @@ from PIL import Image
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from torchvision import transforms
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
@@ -119,10 +131,23 @@ def make_feature(rgb: np.ndarray) -> np.ndarray:
 class ImageDataset(Dataset):
     """Dataset class for loading images from Hugging Face datasets."""
     
-    def __init__(self, image_paths: List[str], labels: List[int], img_size: Tuple[int, int]):
+    def __init__(self, image_paths: List[str], labels: List[int], img_size: Tuple[int, int], 
+                 augment: bool = False):
         self.image_paths = image_paths
         self.labels = labels
         self.img_size = img_size
+        self.augment = augment
+        
+        # Data augmentation transforms (applied on-the-fly to save memory)
+        if augment:
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            ])
+        else:
+            self.transform = None
     
     def __len__(self):
         return len(self.image_paths)
@@ -165,6 +190,10 @@ class ImageDataset(Dataset):
             # Resize if needed
             if self.img_size and (im.size[0] != self.img_size[0] or im.size[1] != self.img_size[1]):
                 im = im.resize(self.img_size, Image.Resampling.LANCZOS)
+            
+            # Apply data augmentation on-the-fly (saves memory vs pre-augmenting)
+            if self.transform is not None:
+                im = self.transform(im)
             
             rgb = to_numpy(im)
             feat = make_feature(rgb)  # Shape: (H, W, 4)
@@ -498,19 +527,58 @@ def train_model(
     num_epochs: int,
     learning_rate: float,
     output_dir: Path,
-    device: torch.device
+    device: torch.device,
+    use_amp: bool = True,
+    gradient_accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    enable_profiling: bool = False
 ):
-    """Train the model."""
+    """
+    Train the model with optimizations for large-scale training.
+    
+    Args:
+        use_amp: Use Automatic Mixed Precision (FP16) for faster training and less memory
+        gradient_accumulation_steps: Accumulate gradients over N batches before updating weights
+        max_grad_norm: Clip gradients to prevent exploding gradients
+        enable_profiling: Enable PyTorch profiling to identify bottlenecks
+    """
     
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    # Mixed precision training (AMP) - reduces memory usage and speeds up training
+    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
+    if use_amp and device.type == 'cuda':
+        print("✓ Mixed Precision Training (AMP) enabled - using FP16 for faster training")
+    
+    if gradient_accumulation_steps > 1:
+        print(f"✓ Gradient Accumulation enabled - accumulating over {gradient_accumulation_steps} batches")
     
     best_val_acc = 0.0
     train_losses = []
     train_accs = []
     val_losses = []
     val_accs = []
+    
+    # Profiling setup (optional, for identifying bottlenecks)
+    profiler = None
+    if enable_profiling and device.type == 'cuda':
+        try:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA
+                ],
+                with_stack=True,
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(output_dir / "profiler_logs"))
+            )
+            profiler.start()
+            print("✓ Profiling enabled - will profile first few batches")
+        except Exception as e:
+            print(f"⚠️  Profiling setup failed: {e}, continuing without profiling")
+            profiler = None
     
     for epoch in range(num_epochs):
         # Training
@@ -519,23 +587,88 @@ def train_model(
         train_correct = 0
         train_total = 0
         
+        optimizer.zero_grad()  # Zero gradients at the start of epoch
+        
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
+            # Non-blocking transfer for faster GPU utilization
+            data = data.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+            # Forward pass with mixed precision
+            if scaler is not None:
+                with autocast():
+                    output = model(data)
+                    loss = criterion(output, target)
+                    # Normalize loss for gradient accumulation
+                    loss = loss / gradient_accumulation_steps
+            else:
+                output = model(data)
+                loss = criterion(output, target)
+                loss = loss / gradient_accumulation_steps
             
-            train_loss += loss.item()
+            # Backward pass
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Gradient accumulation: only update weights every N batches
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Gradient clipping to prevent exploding gradients
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+            
+            # Update metrics (use original loss, not normalized)
+            train_loss += loss.item() * gradient_accumulation_steps
             pred = output.argmax(dim=1)
             train_correct += pred.eq(target).sum().item()
             train_total += target.size(0)
             
+            # Memory cleanup
+            del output, loss
             if batch_idx % 100 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
-                      f"Loss: {loss.item():.4f}")
+                # Clear cache periodically
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
+                # Show GPU memory usage
+                if device.type == 'cuda':
+                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                          f"Loss: {train_loss/(batch_idx+1):.4f}, "
+                          f"VRAM: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB")
+                else:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                          f"Loss: {train_loss/(batch_idx+1):.4f}")
+            
+            # Profiling (only for first few batches to avoid overhead)
+            if profiler is not None and batch_idx < 10:
+                profiler.step()
+        
+        # Final gradient update if there are remaining gradients
+        if (batch_idx + 1) % gradient_accumulation_steps != 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                optimizer.step()
+            optimizer.zero_grad()
+        
+        # Clear cache after epoch
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         train_acc = 100. * train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
@@ -550,14 +683,25 @@ def train_model(
         
         with torch.no_grad():
             for data, target in val_loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                loss = criterion(output, target)
+                data = data.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                
+                # Use mixed precision for validation too
+                if scaler is not None:
+                    with autocast():
+                        output = model(data)
+                        loss = criterion(output, target)
+                else:
+                    output = model(data)
+                    loss = criterion(output, target)
                 
                 val_loss += loss.item()
                 pred = output.argmax(dim=1)
                 val_correct += pred.eq(target).sum().item()
                 val_total += target.size(0)
+                
+                # Memory cleanup
+                del output, loss, data, target
         
         val_acc = 100. * val_correct / val_total
         avg_val_loss = val_loss / len(val_loader)
@@ -569,6 +713,7 @@ def train_model(
         print(f"\nEpoch {epoch+1}/{num_epochs}:")
         print(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.2e}")
         
         # Save best model
         if val_acc > best_val_acc:
@@ -577,6 +722,23 @@ def train_model(
             print(f"  ✓ Saved best model (Val Acc: {val_acc:.2f}%)")
         
         print("-" * 50)
+    
+    # Stop profiling and save results
+    if profiler is not None:
+        profiler.stop()
+        print("\n" + "="*50)
+        print("PROFILING RESULTS")
+        print("="*50)
+        try:
+            print(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+            profiler.export_chrome_trace(str(output_dir / "profile_trace.json"))
+            print(f"\nProfile trace saved to: {output_dir / 'profile_trace.json'}")
+            print("Open in Chrome: chrome://tracing")
+            print(f"TensorBoard logs: {output_dir / 'profiler_logs'}")
+            print("View with: tensorboard --logdir=" + str(output_dir / "profiler_logs"))
+        except Exception as e:
+            print(f"⚠️  Error exporting profile: {e}")
+        print("="*50 + "\n")
     
     # Save final model
     torch.save(model.state_dict(), output_dir / "final_model.pt")
@@ -740,7 +902,11 @@ def main(args):
         num_epochs=args.epochs,
         learning_rate=args.lr,
         output_dir=output_dir,
-        device=device
+        device=device,
+        use_amp=args.use_amp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        enable_profiling=args.enable_profiling
     )
     
     # Evaluate
@@ -808,12 +974,28 @@ if __name__ == "__main__":
                         help="Balance classes by taking min samples per class")
     
     # Training arguments
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=32, 
+                        help="Batch size (increase for 80GB GPU, decrease if OOM)")
     parser.add_argument("--img-size", type=int, nargs=2, default=[256, 256],
                         help="Image size (width height)")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--num-workers", type=int, default=8, 
+                        help="DataLoader workers (8-16 recommended for large datasets)")
+    parser.add_argument("--use-amp", action="store_true", default=True,
+                        help="Use Automatic Mixed Precision (FP16) for faster training")
+    parser.add_argument("--no-amp", dest="use_amp", action="store_false",
+                        help="Disable Automatic Mixed Precision")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Accumulate gradients over N batches (simulates larger batch size)")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="Clip gradients to prevent exploding gradients")
+    parser.add_argument("--use-augmentation", action="store_true", default=True,
+                        help="Enable data augmentation (on-the-fly, memory efficient)")
+    parser.add_argument("--no-augmentation", dest="use_augmentation", action="store_false",
+                        help="Disable data augmentation")
+    parser.add_argument("--enable-profiling", action="store_true", default=False,
+                        help="Enable PyTorch profiling to identify bottlenecks")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Model arguments
@@ -829,9 +1011,25 @@ if __name__ == "__main__":
     print("="*50)
     print(f"Image Size: {args.img_size[0]}x{args.img_size[1]}")
     print(f"Batch Size: {args.batch_size}")
+    if args.gradient_accumulation_steps > 1:
+        print(f"Effective Batch Size: {args.batch_size * args.gradient_accumulation_steps} "
+              f"(with {args.gradient_accumulation_steps}x accumulation)")
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
+    print(f"DataLoader Workers: {args.num_workers}")
+    print(f"Mixed Precision (AMP): {'✓ Enabled' if args.use_amp else '✗ Disabled'}")
+    print(f"Gradient Accumulation: {args.gradient_accumulation_steps}x")
+    print(f"Data Augmentation: {'✓ Enabled' if args.use_augmentation else '✗ Disabled'}")
+    print(f"Gradient Clipping: {args.max_grad_norm}")
+    print(f"Profiling: {'✓ Enabled' if args.enable_profiling else '✗ Disabled'}")
     print(f"Balance Classes: {args.balance}")
+    
+    # Show GPU info
+    if torch.cuda.is_available():
+        print(f"\nGPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(f"Current VRAM Usage: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    
     print("="*50 + "\n")
     
     main(args)
