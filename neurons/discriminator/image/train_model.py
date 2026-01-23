@@ -68,6 +68,15 @@ except ImportError as e:
     list_hf_files = None
     download_module = None
 
+# Import download tracker
+try:
+    from .download_tracker import DownloadTracker
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from download_tracker import DownloadTracker
+
 # ---------------------------
 # GPU Configuration
 # ---------------------------
@@ -234,10 +243,12 @@ def download_dataset_to_disk(
     output_dir: Path,
     media_type: str = "real",  # "real", "synthetic", "semisynthetic"
     max_files: Optional[int] = None,
-    max_images_per_file: Optional[int] = None
+    max_images_per_file: Optional[int] = None,
+    tracker: Optional[DownloadTracker] = None,
+    force_download: bool = False
 ) -> List[str]:
     """
-    Download dataset to disk and extract images.
+    Download dataset to disk and extract images with tracking.
     
     Args:
         dataset_name: Hugging Face dataset name
@@ -245,6 +256,8 @@ def download_dataset_to_disk(
         media_type: Type of media (real, synthetic, semisynthetic)
         max_files: Maximum number of files to download (None = all)
         max_images_per_file: Maximum images to extract per file (None = all)
+        tracker: DownloadTracker instance for tracking status
+        force_download: If True, re-download even if already downloaded
     
     Returns:
         List of paths to downloaded image files
@@ -254,6 +267,14 @@ def download_dataset_to_disk(
         return []
     
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize tracker if not provided
+    if tracker is None:
+        tracker = DownloadTracker()
+    
+    # Clear dataset from tracker if force download
+    if force_download:
+        tracker.clear_dataset(dataset_name)
     
     # Create DatasetConfig
     dataset_config = DatasetConfig(
@@ -284,52 +305,93 @@ def download_dataset_to_disk(
         
         print(f"  Found {len(filenames)} files (format: {detected_format})")
         
+        # Check database for already downloaded files
+        files_to_download = []
+        already_downloaded = []
+        
+        for filename in filenames:
+            if tracker.is_downloaded(dataset_name, filename) and not force_download:
+                already_downloaded.append(filename)
+            else:
+                files_to_download.append(filename)
+        
+        if already_downloaded:
+            print(f"  ✓ Found {len(already_downloaded)} already downloaded files in database")
+        
         # Limit number of files if specified
-        if max_files and len(filenames) > max_files:
-            import random
-            filenames = random.sample(filenames, max_files)
-            print(f"  Limiting to {max_files} files")
+        if max_files:
+            # Prioritize files that need downloading
+            if len(files_to_download) > max_files:
+                import random
+                files_to_download = random.sample(files_to_download, max_files)
+            elif len(files_to_download) < max_files and already_downloaded:
+                # Add some already downloaded files if we need more
+                needed = max_files - len(files_to_download)
+                files_to_download.extend(already_downloaded[:needed])
         
-        # Get download URLs using the private function
-        remote_paths = download_module._get_download_urls(dataset_name, filenames)
-        
-        # Download files
-        print(f"  Downloading {len(remote_paths)} files...")
-        downloaded_files = download_files(remote_paths, output_dir)
-        
-        if not downloaded_files:
-            print(f"  ⚠️  Failed to download any files for {dataset_name}")
-            return []
-        
-        # Extract images from downloaded files
+        # Get image paths from already downloaded files
         image_paths = []
-        for source_file in downloaded_files:
-            num_items = max_images_per_file if max_images_per_file else 1000
-            count = 0
-            
-            for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items):
-                if count >= num_items:
-                    break
-                
-                # Save image to disk
-                if isinstance(media_obj, Image.Image):
-                    # Generate unique filename
-                    img_hash = hashlib.md5(f"{dataset_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
-                    img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
-                    
-                    # Convert to RGB and save
-                    if media_obj.mode != 'RGB':
-                        media_obj = media_obj.convert('RGB')
-                    media_obj.save(img_path, 'JPEG', quality=95)
-                    image_paths.append(str(img_path))
-                    count += 1
-                    
-                    if count % 100 == 0:
-                        print(f"    Extracted {count} images from {source_file.name}...")
-            
-            print(f"    Extracted {count} images from {source_file.name}")
+        if already_downloaded:
+            image_paths = tracker.get_image_paths(dataset_name, output_dir)
+            print(f"  ✓ Using {len(image_paths)} images from previously downloaded files")
         
-        print(f"  ✓ Downloaded and extracted {len(image_paths)} images from {dataset_name}")
+        # Download and extract remaining files
+        if files_to_download:
+            print(f"  Downloading {len(files_to_download)} new files...")
+            
+            # Get download URLs using the private function
+            remote_paths = download_module._get_download_urls(dataset_name, files_to_download)
+            
+            # Download files
+            downloaded_files = download_files(remote_paths, output_dir)
+            
+            if not downloaded_files:
+                print(f"  ⚠️  Failed to download any files for {dataset_name}")
+            else:
+                # Extract images from downloaded files
+                for source_file in downloaded_files:
+                    file_name = source_file.name
+                    
+                    # Mark as downloading
+                    tracker.mark_downloading(
+                        dataset_name, file_name, detected_format, str(output_dir)
+                    )
+                    
+                    try:
+                        num_items = max_images_per_file if max_images_per_file else None  # None = all
+                        count = 0
+                        file_image_paths = []
+                        
+                        for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items or 10000):
+                            # Save image to disk
+                            if isinstance(media_obj, Image.Image):
+                                # Generate unique filename
+                                img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
+                                img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
+                                
+                                # Convert to RGB and save
+                                if media_obj.mode != 'RGB':
+                                    media_obj = media_obj.convert('RGB')
+                                media_obj.save(img_path, 'JPEG', quality=95)
+                                file_image_paths.append(str(img_path))
+                                image_paths.append(str(img_path))
+                                count += 1
+                                
+                                if count % 100 == 0:
+                                    print(f"    Extracted {count} images from {file_name}...")
+                        
+                        # Mark as completed in database
+                        tracker.mark_completed(dataset_name, file_name, count)
+                        print(f"    ✓ Extracted {count} images from {file_name}")
+                        
+                    except Exception as e:
+                        error_msg = str(e)
+                        tracker.mark_failed(dataset_name, file_name, error_msg)
+                        print(f"    ✗ Failed to extract from {file_name}: {error_msg}")
+                        import traceback
+                        traceback.print_exc()
+        
+        print(f"  ✓ Total {len(image_paths)} images available for {dataset_name}")
         return image_paths
         
     except Exception as e:
@@ -605,22 +667,38 @@ def load_all_datasets(
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
             
-            # Check if we should use existing files or force download
-            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
-                # Check if already downloaded
-                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
-                if existing_images:
-                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
-                    paths = [str(p) for p in existing_images]
-                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
-                        import random
-                        paths = random.sample(paths, max_samples_per_dataset)
+            # Initialize tracker
+            tracker = DownloadTracker(cache_dir / "download_tracker.db")
+            
+            # Check database first for already downloaded files
+            if not force_download:
+                stats = tracker.get_dataset_stats(ds_name)
+                if stats['completed_files'] > 0:
+                    print(f"  Found {stats['completed_files']} completed files in database ({stats['total_images']} images)")
+                    # Get image paths from database
+                    paths = tracker.get_image_paths(ds_name, dataset_cache_dir)
+                    if paths:
+                        print(f"  Using {len(paths)} cached images for {ds_name}")
+                        if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                            import random
+                            paths = random.sample(paths, max_samples_per_dataset)
+                    else:
+                        # Database says downloaded but no images found, re-download
+                        paths = download_dataset_to_disk(
+                            ds_name, dataset_cache_dir, media_type="real",
+                            max_files=None,
+                            max_images_per_file=None,
+                            tracker=tracker,
+                            force_download=False
+                        )
                 else:
-                    # Directory exists but no images, download
+                    # Not in database, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="real",
-                        max_files=10,  # Download up to 10 files per dataset
-                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False
                     )
             else:
                 # Force download or directory doesn't exist
@@ -630,10 +708,13 @@ def load_all_datasets(
                     print(f"  Force download: removing existing cache for {ds_name}")
                     shutil.rmtree(dataset_cache_dir, ignore_errors=True)
                 
+                tracker = DownloadTracker(cache_dir / "download_tracker.db")
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="real",
-                    max_files=10,
-                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    max_files=None,
+                    max_images_per_file=None,
+                    tracker=tracker,
+                    force_download=force_download
                 )
         else:
             # Original in-memory loading
@@ -659,22 +740,38 @@ def load_all_datasets(
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
             
-            # Check if we should use existing files or force download
-            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
-                # Check if already downloaded
-                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
-                if existing_images:
-                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
-                    paths = [str(p) for p in existing_images]
-                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
-                        import random
-                        paths = random.sample(paths, max_samples_per_dataset)
+            # Initialize tracker
+            tracker = DownloadTracker(cache_dir / "download_tracker.db")
+            
+            # Check database first for already downloaded files
+            if not force_download:
+                stats = tracker.get_dataset_stats(ds_name)
+                if stats['completed_files'] > 0:
+                    print(f"  Found {stats['completed_files']} completed files in database ({stats['total_images']} images)")
+                    # Get image paths from database
+                    paths = tracker.get_image_paths(ds_name, dataset_cache_dir)
+                    if paths:
+                        print(f"  Using {len(paths)} cached images for {ds_name}")
+                        if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                            import random
+                            paths = random.sample(paths, max_samples_per_dataset)
+                    else:
+                        # Database says downloaded but no images found, re-download
+                        paths = download_dataset_to_disk(
+                            ds_name, dataset_cache_dir, media_type="synthetic",
+                            max_files=None,
+                            max_images_per_file=None,
+                            tracker=tracker,
+                            force_download=False
+                        )
                 else:
-                    # Directory exists but no images, download
+                    # Not in database, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="synthetic",
-                        max_files=10,
-                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False
                     )
             else:
                 # Force download or directory doesn't exist
@@ -684,10 +781,13 @@ def load_all_datasets(
                     print(f"  Force download: removing existing cache for {ds_name}")
                     shutil.rmtree(dataset_cache_dir, ignore_errors=True)
                 
+                tracker = DownloadTracker(cache_dir / "download_tracker.db")
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="synthetic",
-                    max_files=10,
-                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    max_files=None,
+                    max_images_per_file=None,
+                    tracker=tracker,
+                    force_download=force_download
                 )
         else:
             # Original in-memory loading
@@ -713,22 +813,38 @@ def load_all_datasets(
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
             
-            # Check if we should use existing files or force download
-            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
-                # Check if already downloaded
-                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
-                if existing_images:
-                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
-                    paths = [str(p) for p in existing_images]
-                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
-                        import random
-                        paths = random.sample(paths, max_samples_per_dataset)
+            # Initialize tracker
+            tracker = DownloadTracker(cache_dir / "download_tracker.db")
+            
+            # Check database first for already downloaded files
+            if not force_download:
+                stats = tracker.get_dataset_stats(ds_name)
+                if stats['completed_files'] > 0:
+                    print(f"  Found {stats['completed_files']} completed files in database ({stats['total_images']} images)")
+                    # Get image paths from database
+                    paths = tracker.get_image_paths(ds_name, dataset_cache_dir)
+                    if paths:
+                        print(f"  Using {len(paths)} cached images for {ds_name}")
+                        if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                            import random
+                            paths = random.sample(paths, max_samples_per_dataset)
+                    else:
+                        # Database says downloaded but no images found, re-download
+                        paths = download_dataset_to_disk(
+                            ds_name, dataset_cache_dir, media_type="semisynthetic",
+                            max_files=None,
+                            max_images_per_file=None,
+                            tracker=tracker,
+                            force_download=False
+                        )
                 else:
-                    # Directory exists but no images, download
+                    # Not in database, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="semisynthetic",
-                        max_files=10,
-                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False
                     )
             else:
                 # Force download or directory doesn't exist
@@ -738,10 +854,13 @@ def load_all_datasets(
                     print(f"  Force download: removing existing cache for {ds_name}")
                     shutil.rmtree(dataset_cache_dir, ignore_errors=True)
                 
+                tracker = DownloadTracker(cache_dir / "download_tracker.db")
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="semisynthetic",
-                    max_files=10,
-                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    max_files=None,
+                    max_images_per_file=None,
+                    tracker=tracker,
+                    force_download=force_download
                 )
         else:
             # Original in-memory loading
