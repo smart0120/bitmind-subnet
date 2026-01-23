@@ -29,7 +29,7 @@ from PIL import Image
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torchvision import transforms
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -555,7 +555,8 @@ def load_all_datasets(
     max_samples_per_dataset: Optional[int] = None,
     balance_classes: bool = True,
     cache_dir: Optional[str] = None,
-    use_disk_cache: bool = True
+    use_disk_cache: bool = True,
+    force_download: bool = False
 ) -> Tuple[List[str], List[int]]:
     """
     Load all datasets and create labeled dataset.
@@ -589,7 +590,11 @@ def load_all_datasets(
         print("✓ HF_TOKEN found, using authenticated requests\n")
     
     if use_disk_cache:
-        print(f"✓ Using disk cache: {cache_dir.resolve()}\n")
+        print(f"✓ Using disk cache: {cache_dir.resolve()}")
+        if force_download:
+            print("  ⚠️  Force download enabled - will re-download all datasets\n")
+        else:
+            print("  ✓ Will use existing cached files if available\n")
     
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
@@ -599,7 +604,9 @@ def load_all_datasets(
         if use_disk_cache:
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
-            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+            
+            # Check if we should use existing files or force download
+            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
                 # Check if already downloaded
                 existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
                 if existing_images:
@@ -609,12 +616,20 @@ def load_all_datasets(
                         import random
                         paths = random.sample(paths, max_samples_per_dataset)
                 else:
+                    # Directory exists but no images, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="real",
                         max_files=10,  # Download up to 10 files per dataset
                         max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
                     )
             else:
+                # Force download or directory doesn't exist
+                if force_download and dataset_cache_dir.exists():
+                    # Remove existing directory to force fresh download
+                    import shutil
+                    print(f"  Force download: removing existing cache for {ds_name}")
+                    shutil.rmtree(dataset_cache_dir, ignore_errors=True)
+                
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="real",
                     max_files=10,
@@ -643,7 +658,9 @@ def load_all_datasets(
         if use_disk_cache:
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
-            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+            
+            # Check if we should use existing files or force download
+            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
                 # Check if already downloaded
                 existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
                 if existing_images:
@@ -653,12 +670,20 @@ def load_all_datasets(
                         import random
                         paths = random.sample(paths, max_samples_per_dataset)
                 else:
+                    # Directory exists but no images, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="synthetic",
                         max_files=10,
                         max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
                     )
             else:
+                # Force download or directory doesn't exist
+                if force_download and dataset_cache_dir.exists():
+                    # Remove existing directory to force fresh download
+                    import shutil
+                    print(f"  Force download: removing existing cache for {ds_name}")
+                    shutil.rmtree(dataset_cache_dir, ignore_errors=True)
+                
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="synthetic",
                     max_files=10,
@@ -687,7 +712,9 @@ def load_all_datasets(
         if use_disk_cache:
             # Download to disk first
             dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
-            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+            
+            # Check if we should use existing files or force download
+            if not force_download and dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
                 # Check if already downloaded
                 existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
                 if existing_images:
@@ -697,12 +724,20 @@ def load_all_datasets(
                         import random
                         paths = random.sample(paths, max_samples_per_dataset)
                 else:
+                    # Directory exists but no images, download
                     paths = download_dataset_to_disk(
                         ds_name, dataset_cache_dir, media_type="semisynthetic",
                         max_files=10,
                         max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
                     )
             else:
+                # Force download or directory doesn't exist
+                if force_download and dataset_cache_dir.exists():
+                    # Remove existing directory to force fresh download
+                    import shutil
+                    print(f"  Force download: removing existing cache for {ds_name}")
+                    shutil.rmtree(dataset_cache_dir, ignore_errors=True)
+                
                 paths = download_dataset_to_disk(
                     ds_name, dataset_cache_dir, media_type="semisynthetic",
                     max_files=10,
@@ -781,7 +816,7 @@ def train_model(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
     # Mixed precision training (AMP) - reduces memory usage and speeds up training
-    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
+    scaler = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
     if use_amp and device.type == 'cuda':
         print("✓ Mixed Precision Training (AMP) enabled - using FP16 for faster training")
     
@@ -829,7 +864,7 @@ def train_model(
             
             # Forward pass with mixed precision
             if scaler is not None:
-                with autocast():
+                with autocast('cuda'):
                     output = model(data)
                     loss = criterion(output, target)
                     # Normalize loss for gradient accumulation
@@ -921,7 +956,7 @@ def train_model(
                 
                 # Use mixed precision for validation too
                 if scaler is not None:
-                    with autocast():
+                    with autocast('cuda'):
                         output = model(data)
                         loss = criterion(output, target)
                 else:
@@ -1078,7 +1113,8 @@ def main(args):
         max_samples_per_dataset=args.max_samples_per_dataset,
         balance_classes=args.balance,
         cache_dir=args.cache_dir,
-        use_disk_cache=args.use_disk_cache
+        use_disk_cache=args.use_disk_cache,
+        force_download=args.force_download
     )
     
     if len(all_paths) == 0:
@@ -1246,6 +1282,8 @@ if __name__ == "__main__":
                         help="Download datasets to disk first, then load from disk (default: True)")
     parser.add_argument("--no-disk-cache", dest="use_disk_cache", action="store_false",
                         help="Load datasets directly into memory (original behavior)")
+    parser.add_argument("--force-download", action="store_true", default=False,
+                        help="Force re-download of datasets even if cached files exist (default: False, uses existing cache)")
     
     args = parser.parse_args()
     
@@ -1270,6 +1308,7 @@ if __name__ == "__main__":
     if args.use_disk_cache:
         cache_path = Path(args.cache_dir) if args.cache_dir else Path("./datasets_cache")
         print(f"Cache Directory: {cache_path.resolve()}")
+        print(f"Force Download: {'✓ Enabled (will re-download)' if args.force_download else '✗ Disabled (will use existing cache)'}")
     
     # Show GPU info
     if torch.cuda.is_available():

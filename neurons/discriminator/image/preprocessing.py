@@ -9,6 +9,7 @@ from PIL import Image
 from typing import Tuple
 import pywt
 from scipy.signal import wiener
+import warnings
 
 
 def extract_prnu_enhanced(rgb: np.ndarray) -> np.ndarray:
@@ -23,15 +24,25 @@ def extract_prnu_enhanced(rgb: np.ndarray) -> np.ndarray:
         for level_coeffs in coeffs[1:]:
             cH, cV, cD = level_coeffs
             # Use wiener filter with error handling for division by zero
-            try:
-                cH_denoised = wiener(cH, mysize=5)
-                cV_denoised = wiener(cV, mysize=5)
-                cD_denoised = wiener(cD, mysize=5)
-            except (RuntimeWarning, ValueError):
-                # Fallback to median filter if wiener fails
-                cH_denoised = cv2.medianBlur(cH.astype(np.float32), 5)
-                cV_denoised = cv2.medianBlur(cV.astype(np.float32), 5)
-                cD_denoised = cv2.medianBlur(cD.astype(np.float32), 5)
+            # Suppress division warnings from scipy.signal.wiener
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value encountered in divide.*')
+                try:
+                    cH_denoised = wiener(cH, mysize=5)
+                    cV_denoised = wiener(cV, mysize=5)
+                    cD_denoised = wiener(cD, mysize=5)
+                    # Check for NaN/Inf and replace with median filter result if needed
+                    if np.any(np.isnan(cH_denoised)) or np.any(np.isinf(cH_denoised)):
+                        cH_denoised = cv2.medianBlur(cH.astype(np.float32), 5)
+                    if np.any(np.isnan(cV_denoised)) or np.any(np.isinf(cV_denoised)):
+                        cV_denoised = cv2.medianBlur(cV.astype(np.float32), 5)
+                    if np.any(np.isnan(cD_denoised)) or np.any(np.isinf(cD_denoised)):
+                        cD_denoised = cv2.medianBlur(cD.astype(np.float32), 5)
+                except (RuntimeWarning, ValueError):
+                    # Fallback to median filter if wiener fails
+                    cH_denoised = cv2.medianBlur(cH.astype(np.float32), 5)
+                    cV_denoised = cv2.medianBlur(cV.astype(np.float32), 5)
+                    cD_denoised = cv2.medianBlur(cD.astype(np.float32), 5)
             
             # Check for NaN/Inf values
             cH_denoised = np.nan_to_num(cH_denoised, nan=0.0, posinf=1.0, neginf=-1.0)
