@@ -11,12 +11,18 @@ safetensors>=0.4.0
 # Config file handling
 pyyaml>=6.0
 
+# Dataset loading - primary method (required for load_dataset)
+datasets>=2.14.0
+
+# Dataset loading - fallback methods (for large datasets that cause memory issues)
+huggingface_hub>=0.20.0
+pyarrow>=14.0.0
+
 # Already in pyproject.toml but listed for reference:
 # torch>=2.0.0
 # torchvision>=0.15.0
-# opencv-python>=4.8.0
+# opencv-python>=4.8.0  # NOTE: Install with "pip install opencv-python" NOT "pip install cv2"
 # numpy>=2.0.0
 # pandas>=2.0.0
 # scikit-learn>=1.3.0
-# datasets>=2.14.0
 # pillow>=10.0.0
