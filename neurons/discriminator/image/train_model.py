@@ -41,6 +41,8 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import requests
+import base64
+from io import BytesIO
 
 # Suppress trust_remote_code warnings (deprecated, but some datasets still trigger it)
 warnings.filterwarnings('ignore', message='.*trust_remote_code.*', category=UserWarning)
@@ -442,8 +444,11 @@ def download_dataset_to_disk(
                     try:
                         num_items = max_images_per_file if max_images_per_file else None  # None = all
                         count = 0
+                        extracted_any = False
                         
+                        # Try to extract images
                         for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items or 10000):
+                            extracted_any = True
                             # Save image to disk
                             if isinstance(media_obj, Image.Image):
                                 # Generate unique filename
@@ -457,9 +462,137 @@ def download_dataset_to_disk(
                                 file_image_paths.append(str(img_path))
                                 count += 1
                         
+                        # If no images were extracted, try alternative extraction methods
+                        if not extracted_any or count == 0:
+                            # Try direct parquet reading with better column detection
+                            if detected_format == "parquet" and source_file.exists():
+                                try:
+                                    import pyarrow.parquet as pq
+                                    import pandas as pd
+                                    
+                                    table = pq.read_table(source_file)
+                                    df = table.to_pandas()
+                                    
+                                    # Debug: Print available columns
+                                    print(f"    Debug: {file_name} has columns: {list(df.columns)}")
+                                    print(f"    Debug: {file_name} has {len(df)} rows")
+                                    
+                                    # Try multiple column name patterns
+                                    possible_cols = []
+                                    for col in df.columns:
+                                        col_lower = col.lower()
+                                        if any(keyword in col_lower for keyword in ['image', 'img', 'bytes', 'data', 'content', 'file', 'path', 'url']):
+                                            if '_id' not in col_lower and 'width' not in col_lower and 'height' not in col_lower:
+                                                possible_cols.append(col)
+                                    
+                                    if not possible_cols:
+                                        # Try all columns that might contain binary data or paths
+                                        for col in df.columns:
+                                            if df[col].dtype == 'object':
+                                                # Check if column might contain image data
+                                                sample_val = df[col].iloc[0] if len(df) > 0 else None
+                                                if sample_val is not None:
+                                                    if isinstance(sample_val, (bytes, str)) or (isinstance(sample_val, dict) and any(k in str(sample_val).lower() for k in ['bytes', 'image', 'data'])):
+                                                        possible_cols.append(col)
+                                    
+                                    print(f"    Debug: Trying columns: {possible_cols[:5]}")
+                                    
+                                    # Try to extract from each possible column
+                                    for col in possible_cols[:5]:  # Try first 5 columns
+                                        if count >= (num_items or 10000):
+                                            break
+                                        
+                                        col_success = 0
+                                        for idx, row in df.iterrows():
+                                            if count >= (num_items or 10000):
+                                                break
+                                            
+                                            try:
+                                                media_data = row[col]
+                                                if media_data is None or (isinstance(media_data, float) and np.isnan(media_data)):
+                                                    continue
+                                                
+                                                # Try different formats
+                                                img = None
+                                                if isinstance(media_data, bytes):
+                                                    try:
+                                                        img = Image.open(BytesIO(media_data))
+                                                    except:
+                                                        pass
+                                                elif isinstance(media_data, str):
+                                                    # Try base64 decode
+                                                    try:
+                                                        decoded = base64.b64decode(media_data)
+                                                        img = Image.open(BytesIO(decoded))
+                                                    except:
+                                                        # Try as file path or URL
+                                                        try:
+                                                            if media_data.startswith('http'):
+                                                                # Download from URL
+                                                                resp = requests.get(media_data, timeout=10)
+                                                                if resp.status_code == 200:
+                                                                    img = Image.open(BytesIO(resp.content))
+                                                            elif Path(media_data).exists():
+                                                                img = Image.open(media_data)
+                                                        except:
+                                                            pass
+                                                elif isinstance(media_data, dict):
+                                                    # Try to find image data in dict
+                                                    for key in ['bytes', 'data', 'content', 'image', 'path', 'url']:
+                                                        if key in media_data:
+                                                            try:
+                                                                val = media_data[key]
+                                                                if isinstance(val, bytes):
+                                                                    img = Image.open(BytesIO(val))
+                                                                elif isinstance(val, str):
+                                                                    try:
+                                                                        decoded = base64.b64decode(val)
+                                                                        img = Image.open(BytesIO(decoded))
+                                                                    except:
+                                                                        if Path(val).exists():
+                                                                            img = Image.open(val)
+                                                                if img:
+                                                                    break
+                                                            except:
+                                                                continue
+                                                
+                                                if img:
+                                                    # Generate unique filename
+                                                    img_hash = hashlib.md5(f"{dataset_name}_{file_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
+                                                    img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
+                                                    
+                                                    # Convert to RGB and save
+                                                    if img.mode != 'RGB':
+                                                        img = img.convert('RGB')
+                                                    img.save(img_path, 'JPEG', quality=95)
+                                                    file_image_paths.append(str(img_path))
+                                                    count += 1
+                                                    col_success += 1
+                                                    
+                                                    if count % 100 == 0:
+                                                        print(f"    Extracted {count} images from {file_name} (column: {col})...")
+                                                    
+                                            except Exception as e:
+                                                continue
+                                        
+                                        if col_success > 0:
+                                            print(f"    ✓ Successfully extracted {col_success} images from column '{col}' in {file_name}")
+                                            break  # Found working column
+                                    
+                                except Exception as e:
+                                    error_msg = f"Alternative extraction failed: {str(e)}"
+                                    if count == 0:
+                                        tracker.mark_failed(dataset_name, file_name, error_msg)
+                                        return (file_name, 0, [], error_msg)
+                        
                         # Mark as completed in database
-                        tracker.mark_completed(dataset_name, file_name, count)
-                        return (file_name, count, file_image_paths, None)
+                        if count > 0:
+                            tracker.mark_completed(dataset_name, file_name, count)
+                            return (file_name, count, file_image_paths, None)
+                        else:
+                            error_msg = f"No images extracted - parquet file may not contain image data or column not found"
+                            tracker.mark_failed(dataset_name, file_name, error_msg)
+                            return (file_name, 0, [], error_msg)
                         
                     except Exception as e:
                         error_msg = str(e)
