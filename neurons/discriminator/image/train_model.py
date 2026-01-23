@@ -38,6 +38,9 @@ from datasets import load_dataset, IterableDataset
 from safetensors.torch import save_file
 import yaml
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import requests
 
 # Suppress trust_remote_code warnings (deprecated, but some datasets still trigger it)
 warnings.filterwarnings('ignore', message='.*trust_remote_code.*', category=UserWarning)
@@ -236,6 +239,74 @@ class ImageDataset(Dataset):
             return torch.zeros(C, H, W), torch.tensor(0, dtype=torch.long)
 
 # ---------------------------
+# Parallel Download Functions
+# ---------------------------
+def download_files_parallel(
+    urls: List[str], 
+    output_dir: Path, 
+    max_workers: int = 4,
+    chunk_size: int = 8192
+) -> List[Path]:
+    """
+    Download multiple files in parallel.
+    
+    Args:
+        urls: List of URLs to download
+        output_dir: Directory to save the files
+        max_workers: Number of parallel download workers
+        chunk_size: Size of chunks to download at a time
+    
+    Returns:
+        List of successfully downloaded file paths
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloaded_files = []
+    downloaded_lock = Lock()
+    
+    def download_single(url):
+        """Download a single file."""
+        try:
+            import requests
+            filename = os.path.basename(url)
+            filepath = output_dir / filename
+            
+            # Skip if already exists
+            if filepath.exists():
+                return filepath
+            
+            response = requests.get(url, stream=True, timeout=3600)
+            if response.status_code != 200:
+                print(f"  ⚠️  Failed to download {filename}: Status {response.status_code}")
+                return None
+            
+            with open(filepath, "wb") as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+            
+            return filepath
+        except Exception as e:
+            print(f"  ⚠️  Error downloading {os.path.basename(url)}: {e}")
+            return None
+    
+    # Download files in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(download_single, url): url for url in urls}
+        
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
+            if result:
+                with downloaded_lock:
+                    downloaded_files.append(result)
+            if completed % 10 == 0:
+                print(f"  Downloaded {completed}/{len(urls)} files...")
+    
+    return downloaded_files
+
+
+# ---------------------------
 # Dataset Download to Disk
 # ---------------------------
 def download_dataset_to_disk(
@@ -245,7 +316,8 @@ def download_dataset_to_disk(
     max_files: Optional[int] = None,
     max_images_per_file: Optional[int] = None,
     tracker: Optional[DownloadTracker] = None,
-    force_download: bool = False
+    force_download: bool = False,
+    max_workers: int = 4  # Number of parallel download/extraction workers
 ) -> List[str]:
     """
     Download dataset to disk and extract images with tracking.
@@ -305,15 +377,21 @@ def download_dataset_to_disk(
         
         print(f"  Found {len(filenames)} files (format: {detected_format})")
         
-        # Check database for already downloaded files
+        # Check database for already downloaded files (batch check for speed)
         files_to_download = []
         already_downloaded = []
         
-        for filename in filenames:
-            if tracker.is_downloaded(dataset_name, filename) and not force_download:
-                already_downloaded.append(filename)
-            else:
-                files_to_download.append(filename)
+        # Batch check all files at once for better performance
+        if not force_download:
+            # Get all downloaded files for this dataset from database
+            downloaded_files_db = {f[0] for f in tracker.get_downloaded_files(dataset_name)}
+            for filename in filenames:
+                if filename in downloaded_files_db:
+                    already_downloaded.append(filename)
+                else:
+                    files_to_download.append(filename)
+        else:
+            files_to_download = filenames
         
         if already_downloaded:
             print(f"  ✓ Found {len(already_downloaded)} already downloaded files in database")
@@ -337,20 +415,24 @@ def download_dataset_to_disk(
         
         # Download and extract remaining files
         if files_to_download:
-            print(f"  Downloading {len(files_to_download)} new files...")
+            print(f"  Downloading {len(files_to_download)} new files (using {max_workers} parallel workers)...")
             
             # Get download URLs using the private function
             remote_paths = download_module._get_download_urls(dataset_name, files_to_download)
             
-            # Download files
-            downloaded_files = download_files(remote_paths, output_dir)
+            # Download files in parallel
+            downloaded_files = download_files_parallel(remote_paths, output_dir, max_workers=max_workers)
             
             if not downloaded_files:
                 print(f"  ⚠️  Failed to download any files for {dataset_name}")
             else:
-                # Extract images from downloaded files
-                for source_file in downloaded_files:
+                # Extract images from downloaded files in parallel
+                image_paths_lock = Lock()
+                
+                def extract_from_file(source_file):
+                    """Extract images from a single file."""
                     file_name = source_file.name
+                    file_image_paths = []
                     
                     # Mark as downloading
                     tracker.mark_downloading(
@@ -360,7 +442,6 @@ def download_dataset_to_disk(
                     try:
                         num_items = max_images_per_file if max_images_per_file else None  # None = all
                         count = 0
-                        file_image_paths = []
                         
                         for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items or 10000):
                             # Save image to disk
@@ -374,22 +455,33 @@ def download_dataset_to_disk(
                                     media_obj = media_obj.convert('RGB')
                                 media_obj.save(img_path, 'JPEG', quality=95)
                                 file_image_paths.append(str(img_path))
-                                image_paths.append(str(img_path))
                                 count += 1
-                                
-                                if count % 100 == 0:
-                                    print(f"    Extracted {count} images from {file_name}...")
                         
                         # Mark as completed in database
                         tracker.mark_completed(dataset_name, file_name, count)
-                        print(f"    ✓ Extracted {count} images from {file_name}")
+                        return (file_name, count, file_image_paths, None)
                         
                     except Exception as e:
                         error_msg = str(e)
                         tracker.mark_failed(dataset_name, file_name, error_msg)
-                        print(f"    ✗ Failed to extract from {file_name}: {error_msg}")
-                        import traceback
-                        traceback.print_exc()
+                        return (file_name, 0, [], error_msg)
+                
+                # Process files in parallel
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(extract_from_file, source_file): source_file 
+                              for source_file in downloaded_files}
+                    
+                    completed = 0
+                    for future in as_completed(futures):
+                        completed += 1
+                        file_name, count, file_image_paths, error = future.result()
+                        
+                        if error:
+                            print(f"    ✗ [{completed}/{len(downloaded_files)}] Failed {file_name}: {error}")
+                        else:
+                            with image_paths_lock:
+                                image_paths.extend(file_image_paths)
+                            print(f"    ✓ [{completed}/{len(downloaded_files)}] Extracted {count} images from {file_name}")
         
         print(f"  ✓ Total {len(image_paths)} images available for {dataset_name}")
         return image_paths
@@ -618,7 +710,8 @@ def load_all_datasets(
     balance_classes: bool = True,
     cache_dir: Optional[str] = None,
     use_disk_cache: bool = True,
-    force_download: bool = False
+    force_download: bool = False,
+    download_workers: int = 4
 ) -> Tuple[List[str], List[int]]:
     """
     Load all datasets and create labeled dataset.
@@ -684,13 +777,14 @@ def load_all_datasets(
                             paths = random.sample(paths, max_samples_per_dataset)
                     else:
                         # Database says downloaded but no images found, re-download
-                        paths = download_dataset_to_disk(
-                            ds_name, dataset_cache_dir, media_type="real",
-                            max_files=None,
-                            max_images_per_file=None,
-                            tracker=tracker,
-                            force_download=False
-                        )
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="real",
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False,
+                        max_workers=download_workers
+                    )
                 else:
                     # Not in database, download
                     paths = download_dataset_to_disk(
@@ -698,7 +792,8 @@ def load_all_datasets(
                         max_files=None,
                         max_images_per_file=None,
                         tracker=tracker,
-                        force_download=False
+                        force_download=False,
+                        max_workers=args.download_workers
                     )
             else:
                 # Force download or directory doesn't exist
@@ -714,7 +809,8 @@ def load_all_datasets(
                     max_files=None,
                     max_images_per_file=None,
                     tracker=tracker,
-                    force_download=force_download
+                    force_download=force_download,
+                    max_workers=download_workers
                 )
         else:
             # Original in-memory loading
@@ -757,13 +853,14 @@ def load_all_datasets(
                             paths = random.sample(paths, max_samples_per_dataset)
                     else:
                         # Database says downloaded but no images found, re-download
-                        paths = download_dataset_to_disk(
-                            ds_name, dataset_cache_dir, media_type="synthetic",
-                            max_files=None,
-                            max_images_per_file=None,
-                            tracker=tracker,
-                            force_download=False
-                        )
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="synthetic",
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False,
+                        max_workers=download_workers
+                    )
                 else:
                     # Not in database, download
                     paths = download_dataset_to_disk(
@@ -771,7 +868,8 @@ def load_all_datasets(
                         max_files=None,
                         max_images_per_file=None,
                         tracker=tracker,
-                        force_download=False
+                        force_download=False,
+                        max_workers=args.download_workers
                     )
             else:
                 # Force download or directory doesn't exist
@@ -787,7 +885,8 @@ def load_all_datasets(
                     max_files=None,
                     max_images_per_file=None,
                     tracker=tracker,
-                    force_download=force_download
+                    force_download=force_download,
+                    max_workers=download_workers
                 )
         else:
             # Original in-memory loading
@@ -830,13 +929,14 @@ def load_all_datasets(
                             paths = random.sample(paths, max_samples_per_dataset)
                     else:
                         # Database says downloaded but no images found, re-download
-                        paths = download_dataset_to_disk(
-                            ds_name, dataset_cache_dir, media_type="semisynthetic",
-                            max_files=None,
-                            max_images_per_file=None,
-                            tracker=tracker,
-                            force_download=False
-                        )
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="semisynthetic",
+                        max_files=None,
+                        max_images_per_file=None,
+                        tracker=tracker,
+                        force_download=False,
+                        max_workers=download_workers
+                    )
                 else:
                     # Not in database, download
                     paths = download_dataset_to_disk(
@@ -844,7 +944,8 @@ def load_all_datasets(
                         max_files=None,
                         max_images_per_file=None,
                         tracker=tracker,
-                        force_download=False
+                        force_download=False,
+                        max_workers=args.download_workers
                     )
             else:
                 # Force download or directory doesn't exist
@@ -860,7 +961,8 @@ def load_all_datasets(
                     max_files=None,
                     max_images_per_file=None,
                     tracker=tracker,
-                    force_download=force_download
+                    force_download=force_download,
+                    max_workers=download_workers
                 )
         else:
             # Original in-memory loading
@@ -1233,7 +1335,8 @@ def main(args):
         balance_classes=args.balance,
         cache_dir=args.cache_dir,
         use_disk_cache=args.use_disk_cache,
-        force_download=args.force_download
+        force_download=args.force_download,
+        download_workers=args.download_workers
     )
     
     if len(all_paths) == 0:
@@ -1403,6 +1506,8 @@ if __name__ == "__main__":
                         help="Load datasets directly into memory (original behavior)")
     parser.add_argument("--force-download", action="store_true", default=False,
                         help="Force re-download of datasets even if cached files exist (default: False, uses existing cache)")
+    parser.add_argument("--download-workers", type=int, default=4,
+                        help="Number of parallel workers for downloading and extracting (default: 4, increase for faster downloads)")
     
     args = parser.parse_args()
     
@@ -1428,6 +1533,7 @@ if __name__ == "__main__":
         cache_path = Path(args.cache_dir) if args.cache_dir else Path("./datasets_cache")
         print(f"Cache Directory: {cache_path.resolve()}")
         print(f"Force Download: {'✓ Enabled (will re-download)' if args.force_download else '✗ Disabled (will use existing cache)'}")
+        print(f"Download Workers: {args.download_workers} (parallel downloads/extraction)")
     
     # Show GPU info
     if torch.cuda.is_available():
