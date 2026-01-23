@@ -250,7 +250,8 @@ def load_hf_dataset(
                         dataset_name,
                         split=split,
                         streaming=True,
-                        token=hf_token
+                        token=hf_token,
+                        batch_size=64
                     )
                 else:
                     # Try normal loading first
@@ -292,7 +293,8 @@ def load_hf_dataset(
                         dataset_name,
                         split=split,
                         streaming=True,
-                        token=hf_token
+                        token=hf_token,
+                        batch_size=64
                     )
                 elif is_rate_limited and use_streaming:
                     # Already using streaming but still rate limited, wait and retry

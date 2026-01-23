@@ -29,7 +29,7 @@ Train an image detector model:
 # From project root
 python -m neurons.discriminator.image.train_model \
     --batch-size 16 \
-    --num_workers 16 \
+    --num-workers 16 \
     --img-size 256 256 \
     --epochs 20 \
     --lr 1e-3 \
