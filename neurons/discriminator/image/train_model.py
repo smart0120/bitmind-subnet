@@ -203,25 +203,20 @@ def load_hf_dataset(
         retry_delay: Initial delay between retries (exponential backoff)
     """
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    use_streaming = False  # Track if we should use streaming mode
     
     for attempt in range(max_retries):
         try:
-            print(f"Loading {dataset_name} (split: {split})... [Attempt {attempt + 1}/{max_retries}]")
+            # Determine if we should use streaming mode
+            if use_streaming or attempt > 0:
+                print(f"Loading {dataset_name} (split: {split})... [Attempt {attempt + 1}/{max_retries}] [Streaming Mode]")
+            else:
+                print(f"Loading {dataset_name} (split: {split})... [Attempt {attempt + 1}/{max_retries}]")
             
-            # Try normal loading first
+            # Try loading dataset
             try:
-                dataset = load_dataset(
-                    dataset_name, 
-                    split=split,
-                    token=hf_token,
-                    num_proc=1  # Reduce parallel requests to avoid rate limits
-                )
-            except Exception as e:
-                error_str = str(e).lower()
-                # If rate limited or connection error, try streaming
-                if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
-                    print(f"  ⚠️  Rate limited, trying streaming mode...")
-                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                if use_streaming or attempt > 0:
+                    # Use streaming mode for retries or if explicitly set
                     dataset = load_dataset(
                         dataset_name,
                         split=split,
@@ -229,14 +224,66 @@ def load_hf_dataset(
                         token=hf_token
                     )
                 else:
+                    # Try normal loading first
+                    dataset = load_dataset(
+                        dataset_name, 
+                        split=split,
+                        token=hf_token,
+                        num_proc=1  # Reduce parallel requests to avoid rate limits
+                    )
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # Check if error is related to data being too large
+                is_data_too_large = (
+                    'decompressed data too large' in error_str or
+                    'data too large' in error_str or
+                    'too large' in error_str and 'data' in error_str
+                )
+                
+                # Check if rate limited
+                is_rate_limited = (
+                    '429' in error_str or 
+                    'rate limit' in error_str or 
+                    'too many requests' in error_str
+                )
+                
+                # If data too large or rate limited, switch to streaming
+                if (is_data_too_large or is_rate_limited) and not use_streaming:
+                    if is_data_too_large:
+                        print(f"  ⚠️  Dataset too large for normal loading, switching to streaming mode...")
+                    else:
+                        print(f"  ⚠️  Rate limited, switching to streaming mode...")
+                    
+                    use_streaming = True
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    
+                    # Retry with streaming
+                    dataset = load_dataset(
+                        dataset_name,
+                        split=split,
+                        streaming=True,
+                        token=hf_token
+                    )
+                elif is_rate_limited and use_streaming:
+                    # Already using streaming but still rate limited, wait and retry
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"  ⚠️  Rate limited even with streaming. Waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Other error, re-raise
                     raise
             
             # Limit samples if specified (only for non-streaming datasets)
             is_streaming = isinstance(dataset, IterableDataset)
+            if is_streaming:
+                print(f"  ✓ Using streaming mode (processes data in chunks, no memory limit)")
             if not is_streaming and max_samples and len(dataset) > max_samples:
                 dataset = dataset.select(range(max_samples))
             
             # Extract image paths
+            # Note: Streaming datasets are processed incrementally, which prevents memory issues
             image_paths = []
             count = 0
             
@@ -293,9 +340,31 @@ def load_hf_dataset(
         
         except Exception as e:
             error_str = str(e).lower()
-            is_rate_limit = '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str
             
-            if is_rate_limit and attempt < max_retries - 1:
+            # Check if error is related to data being too large
+            is_data_too_large = (
+                'decompressed data too large' in error_str or
+                'data too large' in error_str or
+                ('too large' in error_str and 'data' in error_str)
+            )
+            
+            # Check if rate limited
+            is_rate_limit = (
+                '429' in error_str or 
+                'rate limit' in error_str or 
+                'too many requests' in error_str
+            )
+            
+            # If data too large and not using streaming yet, switch to streaming
+            if is_data_too_large and not use_streaming and attempt < max_retries - 1:
+                print(f"  ⚠️  Dataset too large for normal loading: {e}")
+                print(f"  → Switching to streaming mode for next attempt...")
+                use_streaming = True
+                time.sleep(retry_delay * (2 ** attempt))
+                continue
+            
+            # If rate limited, wait and retry
+            elif is_rate_limit and attempt < max_retries - 1:
                 wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
                 print(f"  ⚠️  Rate limited (429). Waiting {wait_time:.1f}s before retry...")
                 if not hf_token:
@@ -303,9 +372,15 @@ def load_hf_dataset(
                     print(f"     export HF_TOKEN=your_token_here")
                 time.sleep(wait_time)
                 continue
+            
+            # Other errors
             else:
                 print(f"  ✗ Error loading {dataset_name}: {e}")
                 if attempt < max_retries - 1:
+                    # If it's a data size issue and we haven't tried streaming, suggest it
+                    if is_data_too_large and not use_streaming:
+                        print(f"  → Will try streaming mode on next attempt...")
+                        use_streaming = True
                     print(f"  Retrying in {retry_delay * (2 ** attempt):.1f}s...")
                     time.sleep(retry_delay * (2 ** attempt))
                 else:
