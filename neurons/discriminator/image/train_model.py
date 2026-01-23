@@ -37,6 +37,7 @@ import pandas as pd
 from datasets import load_dataset, IterableDataset
 from safetensors.torch import save_file
 import yaml
+import hashlib
 
 # Suppress trust_remote_code warnings (deprecated, but some datasets still trigger it)
 warnings.filterwarnings('ignore', message='.*trust_remote_code.*', category=UserWarning)
@@ -52,6 +53,20 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     from model import ImageELAPRNUDetector
     from preprocessing import extract_prnu_enhanced, extract_ela_enhanced
+
+# Import dataset download functionality from gas
+try:
+    from gas.datasets.download import (
+        list_hf_files, download_files, download_single_file, yield_media_from_source
+    )
+    from gas.types import DatasetConfig, Modality, MediaType
+    # Import private functions needed for dataset download
+    import gas.datasets.download as download_module
+except ImportError as e:
+    print(f"Warning: Could not import gas.datasets.download: {e}")
+    print("Make sure gas module is available. Falling back to in-memory loading.")
+    list_hf_files = None
+    download_module = None
 
 # ---------------------------
 # GPU Configuration
@@ -210,6 +225,119 @@ class ImageDataset(Dataset):
             C = 4  # ELA (3) + PRNU (1)
             H, W = self.img_size[1], self.img_size[0]
             return torch.zeros(C, H, W), torch.tensor(0, dtype=torch.long)
+
+# ---------------------------
+# Dataset Download to Disk
+# ---------------------------
+def download_dataset_to_disk(
+    dataset_name: str,
+    output_dir: Path,
+    media_type: str = "real",  # "real", "synthetic", "semisynthetic"
+    max_files: Optional[int] = None,
+    max_images_per_file: Optional[int] = None
+) -> List[str]:
+    """
+    Download dataset to disk and extract images.
+    
+    Args:
+        dataset_name: Hugging Face dataset name
+        output_dir: Directory to save downloaded images
+        media_type: Type of media (real, synthetic, semisynthetic)
+        max_files: Maximum number of files to download (None = all)
+        max_images_per_file: Maximum images to extract per file (None = all)
+    
+    Returns:
+        List of paths to downloaded image files
+    """
+    if download_module is None:
+        print(f"  ⚠️  Cannot download {dataset_name}: gas module not available")
+        return []
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create DatasetConfig
+    dataset_config = DatasetConfig(
+        path=dataset_name,
+        modality=Modality.IMAGE,
+        media_type=MediaType(media_type.lower()),
+        source_format="parquet"  # Default, will be auto-detected
+    )
+    
+    # Detect source format by listing files
+    try:
+        # Try different formats
+        formats_to_try = [".parquet", ".zip", ".jpg", ".png"]
+        filenames = []
+        detected_format = None
+        
+        for fmt in formats_to_try:
+            # Use the private function from the module
+            filenames = download_module._list_remote_dataset_files(dataset_name, fmt)
+            if filenames:
+                detected_format = fmt.lstrip(".")
+                dataset_config.source_format = detected_format
+                break
+        
+        if not filenames:
+            print(f"  ⚠️  No files found for {dataset_name}")
+            return []
+        
+        print(f"  Found {len(filenames)} files (format: {detected_format})")
+        
+        # Limit number of files if specified
+        if max_files and len(filenames) > max_files:
+            import random
+            filenames = random.sample(filenames, max_files)
+            print(f"  Limiting to {max_files} files")
+        
+        # Get download URLs using the private function
+        remote_paths = download_module._get_download_urls(dataset_name, filenames)
+        
+        # Download files
+        print(f"  Downloading {len(remote_paths)} files...")
+        downloaded_files = download_files(remote_paths, output_dir)
+        
+        if not downloaded_files:
+            print(f"  ⚠️  Failed to download any files for {dataset_name}")
+            return []
+        
+        # Extract images from downloaded files
+        image_paths = []
+        for source_file in downloaded_files:
+            num_items = max_images_per_file if max_images_per_file else 1000
+            count = 0
+            
+            for media_obj, metadata in yield_media_from_source(source_file, dataset_config, num_items):
+                if count >= num_items:
+                    break
+                
+                # Save image to disk
+                if isinstance(media_obj, Image.Image):
+                    # Generate unique filename
+                    img_hash = hashlib.md5(f"{dataset_name}_{count}_{time.time()}".encode()).hexdigest()[:8]
+                    img_path = output_dir / f"{dataset_name.replace('/', '_')}_{img_hash}.jpg"
+                    
+                    # Convert to RGB and save
+                    if media_obj.mode != 'RGB':
+                        media_obj = media_obj.convert('RGB')
+                    media_obj.save(img_path, 'JPEG', quality=95)
+                    image_paths.append(str(img_path))
+                    count += 1
+                    
+                    if count % 100 == 0:
+                        print(f"    Extracted {count} images from {source_file.name}...")
+            
+            print(f"    Extracted {count} images from {source_file.name}")
+        
+        print(f"  ✓ Downloaded and extracted {len(image_paths)} images from {dataset_name}")
+        return image_paths
+        
+    except Exception as e:
+        print(f"  ✗ Error downloading {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 
 # ---------------------------
 # Dataset Loading from Hugging Face
@@ -425,12 +553,31 @@ def load_all_datasets(
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
     max_samples_per_dataset: Optional[int] = None,
-    balance_classes: bool = True
+    balance_classes: bool = True,
+    cache_dir: Optional[str] = None,
+    use_disk_cache: bool = True
 ) -> Tuple[List[str], List[int]]:
-    """Load all datasets and create labeled dataset."""
+    """
+    Load all datasets and create labeled dataset.
     
+    Args:
+        real_datasets: List of real image dataset names
+        synthetic_datasets: List of synthetic image dataset names
+        semisynthetic_datasets: List of semisynthetic image dataset names
+        max_samples_per_dataset: Maximum samples per dataset
+        balance_classes: Whether to balance classes
+        cache_dir: Directory to cache downloaded datasets (None = use default)
+        use_disk_cache: If True, download to disk first, then load from disk
+    """
     all_paths = []
     all_labels = []
+    
+    # Set up cache directory
+    if cache_dir is None:
+        cache_dir = Path("./datasets_cache")
+    else:
+        cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     
     # Check for HF token
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -441,12 +588,42 @@ def load_all_datasets(
     else:
         print("✓ HF_TOKEN found, using authenticated requests\n")
     
+    if use_disk_cache:
+        print(f"✓ Using disk cache: {cache_dir.resolve()}\n")
+    
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
     successful = 0
     failed = 0
     for i, ds_name in enumerate(real_datasets):
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        if use_disk_cache:
+            # Download to disk first
+            dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
+            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+                # Check if already downloaded
+                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
+                if existing_images:
+                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
+                    paths = [str(p) for p in existing_images]
+                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                        import random
+                        paths = random.sample(paths, max_samples_per_dataset)
+                else:
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="real",
+                        max_files=10,  # Download up to 10 files per dataset
+                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    )
+            else:
+                paths = download_dataset_to_disk(
+                    ds_name, dataset_cache_dir, media_type="real",
+                    max_files=10,
+                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                )
+        else:
+            # Original in-memory loading
+            paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        
         if paths:
             all_paths.extend(paths)
             all_labels.extend([0] * len(paths))
@@ -463,7 +640,34 @@ def load_all_datasets(
     successful = 0
     failed = 0
     for i, ds_name in enumerate(synthetic_datasets):
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        if use_disk_cache:
+            # Download to disk first
+            dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
+            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+                # Check if already downloaded
+                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
+                if existing_images:
+                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
+                    paths = [str(p) for p in existing_images]
+                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                        import random
+                        paths = random.sample(paths, max_samples_per_dataset)
+                else:
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="synthetic",
+                        max_files=10,
+                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    )
+            else:
+                paths = download_dataset_to_disk(
+                    ds_name, dataset_cache_dir, media_type="synthetic",
+                    max_files=10,
+                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                )
+        else:
+            # Original in-memory loading
+            paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        
         if paths:
             all_paths.extend(paths)
             all_labels.extend([1] * len(paths))
@@ -480,7 +684,34 @@ def load_all_datasets(
     successful = 0
     failed = 0
     for i, ds_name in enumerate(semisynthetic_datasets):
-        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        if use_disk_cache:
+            # Download to disk first
+            dataset_cache_dir = cache_dir / ds_name.replace("/", "_")
+            if dataset_cache_dir.exists() and any(dataset_cache_dir.iterdir()):
+                # Check if already downloaded
+                existing_images = list(dataset_cache_dir.glob("*.jpg")) + list(dataset_cache_dir.glob("*.png"))
+                if existing_images:
+                    print(f"  Using cached images for {ds_name} ({len(existing_images)} images)")
+                    paths = [str(p) for p in existing_images]
+                    if max_samples_per_dataset and len(paths) > max_samples_per_dataset:
+                        import random
+                        paths = random.sample(paths, max_samples_per_dataset)
+                else:
+                    paths = download_dataset_to_disk(
+                        ds_name, dataset_cache_dir, media_type="semisynthetic",
+                        max_files=10,
+                        max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                    )
+            else:
+                paths = download_dataset_to_disk(
+                    ds_name, dataset_cache_dir, media_type="semisynthetic",
+                    max_files=10,
+                    max_images_per_file=max_samples_per_dataset // 10 if max_samples_per_dataset else None
+                )
+        else:
+            # Original in-memory loading
+            paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        
         if paths:
             all_paths.extend(paths)
             all_labels.extend([2] * len(paths))
@@ -845,7 +1076,9 @@ def main(args):
         synthetic_datasets=SYNTHETIC_DATASETS if not args.synthetic_datasets else args.synthetic_datasets,
         semisynthetic_datasets=SEMISYNTHETIC_DATASETS if not args.semisynthetic_datasets else args.semisynthetic_datasets,
         max_samples_per_dataset=args.max_samples_per_dataset,
-        balance_classes=args.balance
+        balance_classes=args.balance,
+        cache_dir=args.cache_dir,
+        use_disk_cache=args.use_disk_cache
     )
     
     if len(all_paths) == 0:
@@ -1006,6 +1239,14 @@ if __name__ == "__main__":
     parser.add_argument("--model-version", type=str, default="1.0.0",
                         help="Model version")
     
+    # Dataset caching arguments
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="Directory to cache downloaded datasets (default: ./datasets_cache)")
+    parser.add_argument("--use-disk-cache", action="store_true", default=True,
+                        help="Download datasets to disk first, then load from disk (default: True)")
+    parser.add_argument("--no-disk-cache", dest="use_disk_cache", action="store_false",
+                        help="Load datasets directly into memory (original behavior)")
+    
     args = parser.parse_args()
     
     print("="*50)
@@ -1025,6 +1266,10 @@ if __name__ == "__main__":
     print(f"Gradient Clipping: {args.max_grad_norm}")
     print(f"Profiling: {'✓ Enabled' if args.enable_profiling else '✗ Disabled'}")
     print(f"Balance Classes: {args.balance}")
+    print(f"Disk Cache: {'✓ Enabled' if args.use_disk_cache else '✗ Disabled (using RAM)'}")
+    if args.use_disk_cache:
+        cache_path = Path(args.cache_dir) if args.cache_dir else Path("./datasets_cache")
+        print(f"Cache Directory: {cache_path.resolve()}")
     
     # Show GPU info
     if torch.cuda.is_available():
