@@ -8,8 +8,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from datetime import datetime
+import time
+import warnings
 
 import cv2
 import numpy as np
@@ -20,9 +22,12 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset, IterableDataset
 from safetensors.torch import save_file
 import yaml
+
+# Suppress trust_remote_code warnings (deprecated, but some datasets still trigger it)
+warnings.filterwarnings('ignore', message='.*trust_remote_code.*', category=UserWarning)
 
 # Import model and preprocessing from local modules
 try:
@@ -180,63 +185,140 @@ class ImageDataset(Dataset):
 # ---------------------------
 # Dataset Loading from Hugging Face
 # ---------------------------
-def load_hf_dataset(dataset_name: str, split: str = "train", max_samples: int = None):
-    """Load dataset from Hugging Face."""
-    try:
-        print(f"Loading {dataset_name} (split: {split})...")
-        dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
-        
-        # Limit samples if specified
-        if max_samples and len(dataset) > max_samples:
-            dataset = dataset.select(range(max_samples))
-        
-        # Extract image paths
-        image_paths = []
-        for item in dataset:
-            if isinstance(item, dict):
-                if 'image' in item:
-                    # Image is already loaded as PIL Image
-                    image_paths.append(item)
-                elif 'path' in item:
-                    image_paths.append(item['path'])
-                else:
-                    # Try to find image field
-                    found = False
-                    for key in ['image', 'img', 'file_path', 'file', 'path']:
-                        if key in item:
-                            val = item[key]
-                            if isinstance(val, Image.Image):
-                                image_paths.append(item)
-                            elif isinstance(val, str):
-                                image_paths.append(val)
-                            found = True
-                            break
-                    if not found:
-                        # Use the first value if it's a path-like string or PIL Image
-                        first_val = list(item.values())[0]
-                        if isinstance(first_val, Image.Image):
-                            image_paths.append(item)
-                        elif isinstance(first_val, str):
-                            image_paths.append(first_val)
-            elif isinstance(item, Image.Image):
-                # Direct PIL Image
-                image_paths.append(item)
-            elif isinstance(item, str):
-                # Direct path string
-                image_paths.append(item)
-        
-        print(f"Loaded {len(image_paths)} images from {dataset_name}")
-        return image_paths
+def load_hf_dataset(
+    dataset_name: str, 
+    split: str = "train", 
+    max_samples: Optional[int] = None,
+    max_retries: int = 3,
+    retry_delay: float = 5.0
+) -> List:
+    """
+    Load dataset from Hugging Face with retry logic for rate limiting.
     
-    except Exception as e:
-        print(f"Error loading {dataset_name}: {e}")
-        return []
+    Args:
+        dataset_name: Name of the dataset
+        split: Dataset split to load
+        max_samples: Maximum samples to load
+        max_retries: Maximum number of retry attempts
+        retry_delay: Initial delay between retries (exponential backoff)
+    """
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Loading {dataset_name} (split: {split})... [Attempt {attempt + 1}/{max_retries}]")
+            
+            # Try normal loading first
+            try:
+                dataset = load_dataset(
+                    dataset_name, 
+                    split=split,
+                    token=hf_token,
+                    num_proc=1  # Reduce parallel requests to avoid rate limits
+                )
+            except Exception as e:
+                error_str = str(e).lower()
+                # If rate limited or connection error, try streaming
+                if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
+                    print(f"  ⚠️  Rate limited, trying streaming mode...")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    dataset = load_dataset(
+                        dataset_name,
+                        split=split,
+                        streaming=True,
+                        token=hf_token
+                    )
+                else:
+                    raise
+            
+            # Limit samples if specified (only for non-streaming datasets)
+            is_streaming = isinstance(dataset, IterableDataset)
+            if not is_streaming and max_samples and len(dataset) > max_samples:
+                dataset = dataset.select(range(max_samples))
+            
+            # Extract image paths
+            image_paths = []
+            count = 0
+            
+            for item in dataset:
+                if max_samples and count >= max_samples:
+                    break
+                
+                if isinstance(item, dict):
+                    if 'image' in item:
+                        # Image is already loaded as PIL Image
+                        image_paths.append(item)
+                        count += 1
+                    elif 'path' in item:
+                        image_paths.append(item['path'])
+                        count += 1
+                    else:
+                        # Try to find image field
+                        found = False
+                        for key in ['image', 'img', 'file_path', 'file', 'path', 'url']:
+                            if key in item:
+                                val = item[key]
+                                if isinstance(val, Image.Image):
+                                    image_paths.append(item)
+                                    count += 1
+                                elif isinstance(val, str):
+                                    image_paths.append(val)
+                                    count += 1
+                                found = True
+                                break
+                        if not found:
+                            # Use the first value if it's a path-like string or PIL Image
+                            first_val = list(item.values())[0]
+                            if isinstance(first_val, Image.Image):
+                                image_paths.append(item)
+                                count += 1
+                            elif isinstance(first_val, str):
+                                image_paths.append(first_val)
+                                count += 1
+                elif isinstance(item, Image.Image):
+                    # Direct PIL Image
+                    image_paths.append(item)
+                    count += 1
+                elif isinstance(item, str):
+                    # Direct path string
+                    image_paths.append(item)
+                    count += 1
+                
+                # Progress indicator for large datasets
+                if count % 10000 == 0 and count > 0:
+                    print(f"  Loaded {count:,} images so far...")
+            
+            print(f"  ✓ Successfully loaded {len(image_paths):,} images from {dataset_name}")
+            return image_paths
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                print(f"  ⚠️  Rate limited (429). Waiting {wait_time:.1f}s before retry...")
+                if not hf_token:
+                    print(f"  💡 Tip: Set HF_TOKEN environment variable to avoid rate limits:")
+                    print(f"     export HF_TOKEN=your_token_here")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"  ✗ Error loading {dataset_name}: {e}")
+                if attempt < max_retries - 1:
+                    print(f"  Retrying in {retry_delay * (2 ** attempt):.1f}s...")
+                    time.sleep(retry_delay * (2 ** attempt))
+                else:
+                    print(f"  ⚠️  Skipping {dataset_name} after {max_retries} attempts")
+                    return []
+    
+    return []
 
 def load_all_datasets(
     real_datasets: List[str],
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
-    max_samples_per_dataset: int = None,
+    max_samples_per_dataset: Optional[int] = None,
     balance_classes: bool = True
 ) -> Tuple[List[str], List[int]]:
     """Load all datasets and create labeled dataset."""
@@ -244,31 +326,72 @@ def load_all_datasets(
     all_paths = []
     all_labels = []
     
+    # Check for HF token
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        print("⚠️  WARNING: No HF_TOKEN found. You may hit rate limits.")
+        print("   Set it with: export HF_TOKEN=your_token_here")
+        print("   Get token from: https://huggingface.co/settings/tokens\n")
+    else:
+        print("✓ HF_TOKEN found, using authenticated requests\n")
+    
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
-    for ds_name in real_datasets:
+    successful = 0
+    failed = 0
+    for i, ds_name in enumerate(real_datasets):
         paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
-        all_paths.extend(paths)
-        all_labels.extend([0] * len(paths))
+        if paths:
+            all_paths.extend(paths)
+            all_labels.extend([0] * len(paths))
+            successful += 1
+        else:
+            failed += 1
+        # Small delay between datasets to avoid rate limits
+        if i < len(real_datasets) - 1:
+            time.sleep(1.0)
+    print(f"  Real datasets: {successful} successful, {failed} failed")
     
     # Load synthetic images (label 1)
     print("\n=== Loading Synthetic Images ===")
-    for ds_name in synthetic_datasets:
+    successful = 0
+    failed = 0
+    for i, ds_name in enumerate(synthetic_datasets):
         paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
-        all_paths.extend(paths)
-        all_labels.extend([1] * len(paths))
+        if paths:
+            all_paths.extend(paths)
+            all_labels.extend([1] * len(paths))
+            successful += 1
+        else:
+            failed += 1
+        # Small delay between datasets to avoid rate limits
+        if i < len(synthetic_datasets) - 1:
+            time.sleep(1.0)
+    print(f"  Synthetic datasets: {successful} successful, {failed} failed")
     
     # Load semisynthetic images (label 2)
     print("\n=== Loading Semi-synthetic Images ===")
-    for ds_name in semisynthetic_datasets:
+    successful = 0
+    failed = 0
+    for i, ds_name in enumerate(semisynthetic_datasets):
         paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
-        all_paths.extend(paths)
-        all_labels.extend([2] * len(paths))
+        if paths:
+            all_paths.extend(paths)
+            all_labels.extend([2] * len(paths))
+            successful += 1
+        else:
+            failed += 1
+        # Small delay between datasets to avoid rate limits
+        if i < len(semisynthetic_datasets) - 1:
+            time.sleep(1.0)
+    print(f"  Semi-synthetic datasets: {successful} successful, {failed} failed")
     
-    print(f"\nTotal samples: {len(all_paths)}")
-    print(f"  Real: {sum(1 for l in all_labels if l == 0)}")
-    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1)}")
-    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2)}")
+    print(f"\n{'='*50}")
+    print(f"Total samples loaded: {len(all_paths):,}")
+    print(f"  Real: {sum(1 for l in all_labels if l == 0):,}")
+    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1):,}")
+    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2):,}")
+    print(f"{'='*50}")
     
     # Balance classes if requested
     if balance_classes:
@@ -487,7 +610,21 @@ def main(args):
     )
     
     if len(all_paths) == 0:
-        print("Error: No images loaded!")
+        print("\n" + "="*50)
+        print("ERROR: No images loaded!")
+        print("="*50)
+        print("Possible causes:")
+        print("  1. Rate limiting (429 errors) - Set HF_TOKEN to avoid:")
+        print("     export HF_TOKEN=your_token_here")
+        print("     Get token from: https://huggingface.co/settings/tokens")
+        print("  2. Network connectivity issues")
+        print("  3. Dataset access permissions")
+        print("  4. All datasets failed to load")
+        print("\nTry:")
+        print("  - Set HF_TOKEN environment variable")
+        print("  - Wait a few minutes and retry (rate limits reset)")
+        print("  - Check your internet connection")
+        print("="*50)
         return
     
     # Split train/val
