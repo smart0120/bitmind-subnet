@@ -777,14 +777,14 @@ def load_all_datasets(
                             paths = random.sample(paths, max_samples_per_dataset)
                     else:
                         # Database says downloaded but no images found, re-download
-                    paths = download_dataset_to_disk(
-                        ds_name, dataset_cache_dir, media_type="real",
-                        max_files=None,
-                        max_images_per_file=None,
-                        tracker=tracker,
-                        force_download=False,
-                        max_workers=download_workers
-                    )
+                        paths = download_dataset_to_disk(
+                            ds_name, dataset_cache_dir, media_type="real",
+                            max_files=None,
+                            max_images_per_file=None,
+                            tracker=tracker,
+                            force_download=False,
+                            max_workers=download_workers
+                        )
                 else:
                     # Not in database, download
                     paths = download_dataset_to_disk(
