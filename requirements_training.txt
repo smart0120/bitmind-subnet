@@ -11,10 +11,6 @@ safetensors>=0.4.0
 # Config file handling
 pyyaml>=6.0
 
-# Dataset loading with Hugging Face Hub (direct file access)
-huggingface_hub>=0.20.0
-pyarrow>=14.0.0
-
 # Already in pyproject.toml but listed for reference:
 # torch>=2.0.0
 # torchvision>=0.15.0
@@ -22,4 +18,5 @@ pyarrow>=14.0.0
 # numpy>=2.0.0
 # pandas>=2.0.0
 # scikit-learn>=1.3.0
+# datasets>=2.14.0
 # pillow>=10.0.0

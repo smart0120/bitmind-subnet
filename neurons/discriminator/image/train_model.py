@@ -2,20 +2,14 @@
 Image Detector Training Script
 Loads datasets from Hugging Face and trains a multiclass classifier (real, synthetic, semisynthetic)
 using ELA+PRNU fusion features. Outputs model in Safetensors format for submission.
-
-Uses PyTorch DataLoader with direct parquet file reading (no load_dataset).
 """
 
 import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple, Any
+from typing import List, Tuple
 from datetime import datetime
-from io import BytesIO
-import base64
-import tempfile
-import warnings
 
 import cv2
 import numpy as np
@@ -26,20 +20,9 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import pandas as pd
-import pyarrow.parquet as pq
+from datasets import load_dataset
 from safetensors.torch import save_file
 import yaml
-
-# Suppress scipy.signal warnings about division by zero
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='scipy.signal')
-
-# Import Hugging Face Hub for direct file access
-try:
-    from huggingface_hub import hf_hub_download, list_repo_files
-    HAS_HF_HUB = True
-except ImportError:
-    HAS_HF_HUB = False
-    print("WARNING: huggingface_hub not found. Please install with: pip install huggingface_hub")
 
 # Import model and preprocessing from local modules
 try:
@@ -123,386 +106,189 @@ def make_feature(rgb: np.ndarray) -> np.ndarray:
     prnu = extract_prnu_enhanced(rgb)  # Single channel
     ela = extract_ela_enhanced(rgb)     # 3 channels (RGB)
     feat = np.concatenate([ela, prnu[..., None]], axis=-1)
-    
-    # Final NaN/Inf check and cleanup
-    feat = np.nan_to_num(feat, nan=0.0, posinf=1.0, neginf=0.0)
-    
     return feat.astype(np.float32)
 
-def load_image_from_data(data: Any, img_size: Tuple[int, int], max_size_mb: float = 50.0) -> Image.Image:
-    """
-    Load image from various formats (PIL Image, bytes, dict, path).
-    
-    Args:
-        data: Image data in various formats
-        img_size: Target image size
-        max_size_mb: Maximum image size in MB before decompression (default: 50MB)
-    """
-    if isinstance(data, Image.Image):
-        im = data.convert("RGB")
-    elif isinstance(data, (bytes, bytearray)):
-        # Check size before loading
-        size_mb = len(data) / (1024 * 1024)
-        if size_mb > max_size_mb:
-            raise ValueError(f"Image too large: {size_mb:.2f}MB (max: {max_size_mb}MB)")
-        
-        try:
-            im = Image.open(BytesIO(data))
-            # Check decompressed size
-            if im.size[0] * im.size[1] > 10000 * 100000:  # 1000MP limit
-                raise ValueError(f"Decompressed image too large: {im.size[0]}x{im.size[1]}")
-            im = im.convert("RGB")
-        except Exception as e:
-            if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
-                raise ValueError(f"Decompressed Data Too Large: {size_mb:.2f}MB")
-            raise
-    elif isinstance(data, str):
-        # Try base64 decode first
-        if len(data) > 100 and not (data.startswith('http') or '/' in data or '\\' in data):
-            try:
-                img_bytes = base64.b64decode(data)
-                size_mb = len(img_bytes) / (1024 * 1024)
-                if size_mb > max_size_mb:
-                    raise ValueError(f"Image too large: {size_mb:.2f}MB (max: {max_size_mb}MB)")
-                im = Image.open(BytesIO(img_bytes)).convert("RGB")
-            except Exception as e:
-                if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
-                    raise ValueError(f"Decompressed Data Too Large")
-                # Assume it's a file path
-                im = pil_load_rgb(data, img_size)
-        else:
-            im = pil_load_rgb(data, img_size)
-    elif isinstance(data, dict):
-        # Try common keys
-        for key in ['image', 'bytes', 'path', 'file_path', 'file']:
-            if key in data:
-                return load_image_from_data(data[key], img_size, max_size_mb)
-        # Use first value
-        first_val = list(data.values())[0]
-        return load_image_from_data(first_val, img_size, max_size_mb)
-    else:
-        raise ValueError(f"Unknown image data type: {type(data)}")
-    
-    if img_size and (im.size[0] != img_size[0] or im.size[1] != img_size[1]):
-        im = im.resize(img_size, Image.Resampling.LANCZOS)
-    
-    return im
-
 # ---------------------------
-# Dataset Classes
+# Dataset Class
 # ---------------------------
 class ImageDataset(Dataset):
-    """PyTorch Dataset for loading images."""
+    """Dataset class for loading images from Hugging Face datasets."""
     
-    def __init__(self, image_data: List[Any], labels: List[int], img_size: Tuple[int, int]):
-        self.image_data = image_data
+    def __init__(self, image_paths: List[str], labels: List[int], img_size: Tuple[int, int]):
+        self.image_paths = image_paths
         self.labels = labels
         self.img_size = img_size
     
     def __len__(self):
-        return len(self.image_data)
+        return len(self.image_paths)
     
     def __getitem__(self, idx):
-        data = self.image_data[idx]
+        path = self.image_paths[idx]
         label = self.labels[idx]
         
         try:
-            im = load_image_from_data(data, self.img_size, max_size_mb=50.0)
+            # Load image
+            if isinstance(path, dict):
+                # Hugging Face dataset format
+                if 'image' in path:
+                    im = path['image']
+                    if not isinstance(im, Image.Image):
+                        im = pil_load_rgb(im, self.img_size)
+                    else:
+                        im = im.convert("RGB")
+                elif 'path' in path:
+                    im = pil_load_rgb(path['path'], self.img_size)
+                else:
+                    # Try to find any image-like field
+                    for key in ['image', 'img', 'file_path', 'file', 'path', 'url']:
+                        if key in path:
+                            val = path[key]
+                            if isinstance(val, Image.Image):
+                                im = val.convert("RGB")
+                            elif isinstance(val, str):
+                                im = pil_load_rgb(val, self.img_size)
+                            break
+                    else:
+                        raise ValueError(f"Unknown path format: {list(path.keys())}")
+            elif isinstance(path, Image.Image):
+                # Already a PIL Image
+                im = path.convert("RGB")
+            else:
+                # String path
+                im = pil_load_rgb(path, self.img_size)
+            
+            # Resize if needed
+            if self.img_size and (im.size[0] != self.img_size[0] or im.size[1] != self.img_size[1]):
+                im = im.resize(self.img_size, Image.Resampling.LANCZOS)
+            
             rgb = to_numpy(im)
             feat = make_feature(rgb)  # Shape: (H, W, 4)
             
-            # Check for NaN/Inf before converting to tensor
-            if np.any(np.isnan(feat)) or np.any(np.isinf(feat)):
-                raise ValueError("NaN or Inf values in features")
-            
             # Convert to tensor: (C, H, W)
             feat_tensor = torch.from_numpy(feat).permute(2, 0, 1).float()
-            
-            # Final check for NaN/Inf in tensor
-            if torch.any(torch.isnan(feat_tensor)) or torch.any(torch.isinf(feat_tensor)):
-                raise ValueError("NaN or Inf values in tensor")
-            
             label_tensor = torch.tensor(label, dtype=torch.long)
             
             return feat_tensor, label_tensor
         
         except Exception as e:
-            # Silently skip problematic images (don't print every error to avoid spam)
-            if "Decompressed Data Too Large" in str(e) or "too large" in str(e).lower():
-                pass  # Skip silently for size errors
-            elif idx % 1000 == 0:  # Only print every 1000th error
-                print(f"Error loading image {idx}: {e}")
-            
+            print(f"Error loading image {path}: {e}")
             # Return zero tensor on error
             C = 4  # ELA (3) + PRNU (1)
             H, W = self.img_size[1], self.img_size[0]
             return torch.zeros(C, H, W), torch.tensor(0, dtype=torch.long)
 
 # ---------------------------
-# Dataset Loading from Hugging Face (Direct Parquet Reading)
+# Dataset Loading from Hugging Face
 # ---------------------------
-def load_hf_dataset_from_parquet(
-    dataset_name: str, 
-    split: str = "train",
-    max_samples: int = None,
-    max_parquet_files: int = None,
-    chunk_size: int = 100000
-) -> List[Any]:
-    """
-    Load dataset from Hugging Face by reading parquet files directly.
-    Uses huggingface_hub to download and pyarrow to read parquet files.
-    
-    Args:
-        dataset_name: Name of the dataset (e.g., "bitmind/ffhq-256")
-        split: Dataset split to load (e.g., "train")
-        max_samples: Maximum number of samples to load (None for all)
-        max_parquet_files: Maximum number of parquet files to process
-    """
-    if not HAS_HF_HUB:
-        raise ImportError(
-            "huggingface_hub is required. Please install it with:\n"
-            "  pip install huggingface_hub\n"
-            "Or install all training requirements:\n"
-            "  pip install -r requirements_training.txt"
-        )
-    
+def load_hf_dataset(dataset_name: str, split: str = "train", max_samples: int = None):
+    """Load dataset from Hugging Face."""
     try:
         print(f"Loading {dataset_name} (split: {split})...")
+        dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
         
-        # List parquet files in the dataset
-        try:
-            all_files = list_repo_files(repo_id=dataset_name, repo_type="dataset")
-            parquet_files = [f for f in all_files if f.endswith('.parquet') and split in f]
-            
-            # Also check in data/ subdirectory
-            if not parquet_files:
-                data_files = [f for f in all_files if 'data' in f and f.endswith('.parquet')]
-                parquet_files = [f for f in data_files if split in f]
-            
-            # If still no files, try any parquet file
-            if not parquet_files:
-                parquet_files = [f for f in all_files if f.endswith('.parquet')]
-            
-            if not parquet_files:
-                print(f"  ⚠️  No parquet files found in {dataset_name}")
-                return []
-            
-            # Limit number of parquet files to process (if max_parquet_files is set)
-            all_parquet_files = [f for f in all_files if f.endswith('.parquet')]
-            total_parquet_count = len(all_parquet_files)
-            if max_parquet_files and max_parquet_files > 0:
-                original_count = len(parquet_files)
-                parquet_files = parquet_files[:max_parquet_files]
-                print(f"  ⚠️  LIMITING: Found {total_parquet_count} total parquet file(s), processing {len(parquet_files)}/{original_count} matching files (limited by --max-parquet-files={max_parquet_files})")
-            else:
-                print(f"  ✓ Loading ALL {len(parquet_files)} parquet file(s) from {total_parquet_count} total")
-            
-        except Exception as e:
-            print(f"  ⚠️  Error listing files: {e}")
-            return []
+        # Limit samples if specified
+        if max_samples and len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
         
-        image_data = []
-        count = 0
-        accumulated_chunk = []  # Accumulate images across multiple parquet files
-        
-        # Process each parquet file
-        for parquet_file in parquet_files:
-            if max_samples and count >= max_samples:
-                break
-            
-            try:
-                print(f"  Processing {parquet_file}...")
-                
-                # Download parquet file (returns path to cached file)
-                try:
-                    tmp_path = hf_hub_download(
-                        repo_id=dataset_name,
-                        filename=parquet_file,
-                        repo_type="dataset"
-                    )
-                    
-                    # Read parquet file
-                    parquet_file_obj = pq.ParquetFile(tmp_path)
-                    total_rows = parquet_file_obj.metadata.num_rows
-                    print(f"    Parquet file has {total_rows:,} rows")
-                    
-                    # Find image column from first batch
-                    first_batch = parquet_file_obj.read_row_groups([0], columns=None)
-                    first_df = first_batch.to_pandas()
-                    
-                    image_col = None
-                    for col in ['image', 'path', 'file_path', 'file', 'img', 'image_path', 'url']:
-                        if col in first_df.columns:
-                            image_col = col
+        # Extract image paths
+        image_paths = []
+        for item in dataset:
+            if isinstance(item, dict):
+                if 'image' in item:
+                    # Image is already loaded as PIL Image
+                    image_paths.append(item)
+                elif 'path' in item:
+                    image_paths.append(item['path'])
+                else:
+                    # Try to find image field
+                    found = False
+                    for key in ['image', 'img', 'file_path', 'file', 'path']:
+                        if key in item:
+                            val = item[key]
+                            if isinstance(val, Image.Image):
+                                image_paths.append(item)
+                            elif isinstance(val, str):
+                                image_paths.append(val)
+                            found = True
                             break
-                    
-                    if image_col is None:
-                        # Try to find any column with image-like data
-                        for col in first_df.columns:
-                            if 'image' in col.lower() and '_id' not in col.lower():
-                                image_col = col
-                                break
-                    
-                    if image_col is None:
-                        print(f"    ⚠️  No image column found in {parquet_file}")
-                        continue
-                    
-                    # Process entire parquet file at once (it's already small at 10k rows)
-                    table = pq.read_table(tmp_path, columns=[image_col])
-                    df = table.to_pandas()
-                    
-                    # Extract images from this parquet file
-                    images_from_file = 0
-                    for _, row in df.iterrows():
-                        if max_samples and count >= max_samples:
-                            break
-                        
-                        try:
-                            img_data = row[image_col]
-                            
-                            if pd.isna(img_data) or img_data is None:
-                                continue
-                            
-                            # Handle different data types
-                            if isinstance(img_data, Image.Image):
-                                accumulated_chunk.append(img_data)
-                                count += 1
-                                images_from_file += 1
-                            elif isinstance(img_data, (bytes, bytearray)):
-                                accumulated_chunk.append(img_data)
-                                count += 1
-                                images_from_file += 1
-                            elif isinstance(img_data, str):
-                                # Could be path or base64
-                                accumulated_chunk.append(img_data)
-                                count += 1
-                                images_from_file += 1
-                            elif isinstance(img_data, dict):
-                                # Extract bytes or image from dict
-                                for key in ['bytes', 'image', 'data', 'content']:
-                                    if key in img_data:
-                                        accumulated_chunk.append(img_data[key])
-                                        count += 1
-                                        images_from_file += 1
-                                        break
-                        
-                        except Exception as e:
-                            continue
-                    
-                    print(f"    Loaded {images_from_file:,} images from {parquet_file} (accumulated: {len(accumulated_chunk):,})")
-                    
-                    # When accumulated chunk reaches chunk_size, add to main list and clear
-                    if len(accumulated_chunk) >= chunk_size:
-                        print(f"    → Flushing chunk of {len(accumulated_chunk):,} images to main list...")
-                        image_data.extend(accumulated_chunk)
-                        accumulated_chunk = []
-                        print(f"    Total loaded so far: {len(image_data):,} images")
-                
-                except Exception as e:
-                    print(f"    ⚠️  Error reading parquet: {e}")
-                    continue
-            
-            except Exception as e:
-                print(f"    ⚠️  Error processing {parquet_file}: {e}")
-                continue
+                    if not found:
+                        # Use the first value if it's a path-like string or PIL Image
+                        first_val = list(item.values())[0]
+                        if isinstance(first_val, Image.Image):
+                            image_paths.append(item)
+                        elif isinstance(first_val, str):
+                            image_paths.append(first_val)
+            elif isinstance(item, Image.Image):
+                # Direct PIL Image
+                image_paths.append(item)
+            elif isinstance(item, str):
+                # Direct path string
+                image_paths.append(item)
         
-        # Add any remaining accumulated images
-        if accumulated_chunk:
-            print(f"    → Flushing final chunk of {len(accumulated_chunk):,} images...")
-            image_data.extend(accumulated_chunk)
-            accumulated_chunk = []
-        
-        print(f"Loaded {len(image_data):,} total images from {dataset_name}")
-        return image_data
+        print(f"Loaded {len(image_paths)} images from {dataset_name}")
+        return image_paths
     
     except Exception as e:
-        print(f"  ⚠️  Error loading {dataset_name}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error loading {dataset_name}: {e}")
         return []
-
 
 def load_all_datasets(
     real_datasets: List[str],
     synthetic_datasets: List[str],
     semisynthetic_datasets: List[str],
-    balance_classes: bool = False,
     max_samples_per_dataset: int = None,
-    max_parquet_files: int = None,
-    chunk_size: int = 100000
-) -> Tuple[List[Any], List[int]]:
+    balance_classes: bool = True
+) -> Tuple[List[str], List[int]]:
     """Load all datasets and create labeled dataset."""
     
-    all_data = []
+    all_paths = []
     all_labels = []
     
     # Load real images (label 0)
     print("\n=== Loading Real Images ===")
     for ds_name in real_datasets:
-        data = load_hf_dataset_from_parquet(
-            ds_name, split="train", 
-            max_samples=max_samples_per_dataset,
-            max_parquet_files=max_parquet_files,
-            chunk_size=chunk_size
-        )
-        all_data.extend(data)
-        all_labels.extend([0] * len(data))
+        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        all_paths.extend(paths)
+        all_labels.extend([0] * len(paths))
     
     # Load synthetic images (label 1)
     print("\n=== Loading Synthetic Images ===")
     for ds_name in synthetic_datasets:
-        data = load_hf_dataset_from_parquet(
-            ds_name, split="train",
-            max_samples=max_samples_per_dataset,
-            max_parquet_files=max_parquet_files
-        )
-        all_data.extend(data)
-        all_labels.extend([1] * len(data))
+        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        all_paths.extend(paths)
+        all_labels.extend([1] * len(paths))
     
     # Load semisynthetic images (label 2)
     print("\n=== Loading Semi-synthetic Images ===")
     for ds_name in semisynthetic_datasets:
-        data = load_hf_dataset_from_parquet(
-            ds_name, split="train",
-            max_samples=max_samples_per_dataset,
-            max_parquet_files=max_parquet_files
-        )
-        all_data.extend(data)
-        all_labels.extend([2] * len(data))
+        paths = load_hf_dataset(ds_name, split="train", max_samples=max_samples_per_dataset)
+        all_paths.extend(paths)
+        all_labels.extend([2] * len(paths))
     
-    print(f"\nTotal samples loaded: {len(all_data):,}")
-    print(f"  Real: {sum(1 for l in all_labels if l == 0):,}")
-    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1):,}")
-    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2):,}")
+    print(f"\nTotal samples: {len(all_paths)}")
+    print(f"  Real: {sum(1 for l in all_labels if l == 0)}")
+    print(f"  Synthetic: {sum(1 for l in all_labels if l == 1)}")
+    print(f"  Semi-synthetic: {sum(1 for l in all_labels if l == 2)}")
     
     # Balance classes if requested
     if balance_classes:
         counts = [sum(1 for l in all_labels if l == i) for i in range(3)]
         min_count = min(counts)
-        discarded = len(all_data) - (min_count * 3)
-        print(f"\n⚠️  WARNING: Balancing will reduce dataset from {len(all_data):,} to {min_count * 3:,} samples")
-        print(f"   This discards {discarded:,} samples ({100*discarded/len(all_data):.1f}% of data)!")
-        print(f"   Class counts: Real={counts[0]:,}, Synthetic={counts[1]:,}, Semi-synthetic={counts[2]:,}")
-        print(f"   Will balance to: {min_count:,} samples per class")
-        print(f"\nBalancing to {min_count:,} samples per class...")
+        print(f"\nBalancing to {min_count} samples per class...")
         
-        balanced_data = []
+        balanced_paths = []
         balanced_labels = []
         for label in range(3):
-            label_data = [d for d, l in zip(all_data, all_labels) if l == label]
-            balanced_data.extend(label_data[:min_count])
+            label_paths = [p for p, l in zip(all_paths, all_labels) if l == label]
+            balanced_paths.extend(label_paths[:min_count])
             balanced_labels.extend([label] * min_count)
         
-        all_data = balanced_data
+        all_paths = balanced_paths
         all_labels = balanced_labels
         
-        print(f"After balancing: {len(all_data):,} samples")
-    else:
-        print(f"\n✓ Using ALL {len(all_data):,} samples (no balancing)")
-        counts = [sum(1 for l in all_labels if l == i) for i in range(3)]
-        print(f"   Class distribution: Real={counts[0]:,}, Synthetic={counts[1]:,}, Semi-synthetic={counts[2]:,}")
+        print(f"After balancing: {len(all_paths)} samples")
     
-    return all_data, all_labels
+    return all_paths, all_labels
 
 # ---------------------------
 # Training Function
@@ -514,27 +300,13 @@ def train_model(
     num_epochs: int,
     learning_rate: float,
     output_dir: Path,
-    device: torch.device,
-    use_amp: bool = True,
-    compile_model: bool = True
+    device: torch.device
 ):
-    """Train the model with optimizations for large GPU."""
+    """Train the model."""
     
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    
-    # Mixed precision training (FP16/BF16) - uses more VRAM and speeds up training
-    scaler = torch.cuda.amp.GradScaler() if use_amp and device.type == 'cuda' else None
-    
-    # Compile model for faster training (PyTorch 2.0+)
-    if compile_model and hasattr(torch, 'compile') and device.type == 'cuda':
-        try:
-            print("Compiling model for faster training...")
-            model = torch.compile(model, mode='reduce-overhead')
-            print("✓ Model compiled successfully")
-        except Exception as e:
-            print(f"⚠️  Model compilation failed: {e}, continuing without compilation")
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
     
     best_val_acc = 0.0
     train_losses = []
@@ -550,68 +322,13 @@ def train_model(
         train_total = 0
         
         for batch_idx, (data, target) in enumerate(train_loader):
-            # Non-blocking transfer for faster GPU utilization
-            data = data.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            
-            # Check for NaN/Inf in input
-            if torch.any(torch.isnan(data)) or torch.any(torch.isinf(data)):
-                if batch_idx % 1000 == 0:
-                    print(f"Warning: NaN/Inf detected in batch {batch_idx}, skipping...")
-                continue
+            data, target = data.to(device), target.to(device)
             
             optimizer.zero_grad()
-            
-            # Mixed precision training
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    output = model(data)
-                    
-                    # Check for NaN/Inf in output
-                    if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
-                        if batch_idx % 1000 == 0:
-                            print(f"Warning: NaN/Inf in model output at batch {batch_idx}, skipping...")
-                        continue
-                    
-                    loss = criterion(output, target)
-                
-                # Check for NaN/Inf in loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if batch_idx % 1000 == 0:
-                        print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping...")
-                    continue
-                
-                scaler.scale(loss).backward()
-                
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                output = model(data)
-                
-                # Check for NaN/Inf in output
-                if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
-                    if batch_idx % 1000 == 0:
-                        print(f"Warning: NaN/Inf in model output at batch {batch_idx}, skipping...")
-                    continue
-                
-                loss = criterion(output, target)
-                
-                # Check for NaN/Inf in loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if batch_idx % 1000 == 0:
-                        print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping...")
-                    continue
-                
-                loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
             
             train_loss += loss.item()
             pred = output.argmax(dim=1)
@@ -619,16 +336,8 @@ def train_model(
             train_total += target.size(0)
             
             if batch_idx % 100 == 0:
-                # Show GPU memory usage
-                if device.type == 'cuda':
-                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
-                    mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
-                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
-                          f"Loss: {loss.item():.4f}, "
-                          f"VRAM: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB")
-                else:
-                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
-                          f"Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}, "
+                      f"Loss: {loss.item():.4f}")
         
         train_acc = 100. * train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
@@ -643,16 +352,9 @@ def train_model(
         
         with torch.no_grad():
             for data, target in val_loader:
-                data = data.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
-                
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        output = model(data)
-                        loss = criterion(output, target)
-                else:
-                    output = model(data)
-                    loss = criterion(output, target)
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss = criterion(output, target)
                 
                 val_loss += loss.item()
                 pred = output.argmax(dim=1)
@@ -773,78 +475,48 @@ def main(args):
     
     # Load datasets
     print("\n" + "="*50)
-    print("LOADING DATASETS FROM HUGGING FACE (Direct Parquet Reading)")
+    print("LOADING DATASETS FROM HUGGING FACE")
     print("="*50)
     
-    all_data, all_labels = load_all_datasets(
+    all_paths, all_labels = load_all_datasets(
         real_datasets=REAL_DATASETS if not args.real_datasets else args.real_datasets,
         synthetic_datasets=SYNTHETIC_DATASETS if not args.synthetic_datasets else args.synthetic_datasets,
         semisynthetic_datasets=SEMISYNTHETIC_DATASETS if not args.semisynthetic_datasets else args.semisynthetic_datasets,
-        balance_classes=args.balance,
         max_samples_per_dataset=args.max_samples_per_dataset,
-        max_parquet_files=args.max_parquet_files,
-        chunk_size=args.chunk_size
+        balance_classes=args.balance
     )
     
-    if len(all_data) == 0:
+    if len(all_paths) == 0:
         print("Error: No images loaded!")
         return
     
     # Split train/val
-    train_data, val_data, train_labels, val_labels = train_test_split(
-        all_data, all_labels, test_size=0.2, random_state=args.seed, stratify=all_labels
+    train_paths, val_paths, train_labels, val_labels = train_test_split(
+        all_paths, all_labels, test_size=0.2, random_state=args.seed, stratify=all_labels
     )
     
-    print(f"\nTrain samples: {len(train_data)}")
-    print(f"Val samples: {len(val_data)}")
+    print(f"\nTrain samples: {len(train_paths)}")
+    print(f"Val samples: {len(val_paths)}")
     
     # Create datasets
     img_size = (args.img_size[0], args.img_size[1])
-    train_dataset = ImageDataset(train_data, train_labels, img_size)
-    val_dataset = ImageDataset(val_data, val_labels, img_size)
+    train_dataset = ImageDataset(train_paths, train_labels, img_size)
+    val_dataset = ImageDataset(val_paths, val_labels, img_size)
     
-    # Create data loaders with optimizations
-    use_cuda = torch.cuda.is_available()
+    # Create data loaders
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        num_workers=args.num_workers, 
-        pin_memory=use_cuda,
-        persistent_workers=args.num_workers > 0,  # Keep workers alive between epochs
-        prefetch_factor=2 if args.num_workers > 0 else None,  # Prefetch batches
-        drop_last=True  # Drop incomplete batch for consistent training
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True if torch.cuda.is_available() else False
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False,
-        num_workers=args.num_workers, 
-        pin_memory=use_cuda,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True if torch.cuda.is_available() else False
     )
     
     # Create model
     model = ImageELAPRNUDetector(num_classes=3, input_channels=4).to(device)
     print(f"\nModel created on {device}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Estimate memory usage and suggest batch size
-    if torch.cuda.is_available():
-        # Estimate memory per sample (4 channels, 256x256)
-        img_size = args.img_size[0] * args.img_size[1]
-        bytes_per_sample = img_size * 4 * 4  # 4 channels * 4 bytes (float32)
-        estimated_batch_memory = args.batch_size * bytes_per_sample / (1024**3)  # GB
-        
-        print(f"\nEstimated memory per batch: ~{estimated_batch_memory:.2f} GB")
-        print(f"Current batch size: {args.batch_size}")
-        
-        # Suggest larger batch size for 80GB GPU
-        if torch.cuda.get_device_properties(0).total_memory > 70 * 1024**3:  # > 70GB
-            suggested_batch = min(512, int(80 / estimated_batch_memory * args.batch_size))
-            if suggested_batch > args.batch_size:
-                print(f"💡 Suggestion: For 80GB GPU, try --batch-size {suggested_batch} to use more VRAM")
     
     # Train
     print("\n" + "="*50)
@@ -856,9 +528,7 @@ def main(args):
         num_epochs=args.epochs,
         learning_rate=args.lr,
         output_dir=output_dir,
-        device=device,
-        use_amp=args.use_amp,
-        compile_model=args.compile_model
+        device=device
     )
     
     # Evaluate
@@ -920,32 +590,18 @@ if __name__ == "__main__":
                         help="Custom list of synthetic image datasets")
     parser.add_argument("--semisynthetic-datasets", type=str, nargs="+", default=None,
                         help="Custom list of semisynthetic image datasets")
-    parser.add_argument("--balance", action="store_true", default=False,
-                        help="Balance classes by taking min samples per class (WARNING: discards data, default: False)")
     parser.add_argument("--max-samples-per-dataset", type=int, default=None,
-                        help="Maximum samples to load per dataset (None for all, default: None = ALL)")
-    parser.add_argument("--max-parquet-files", type=int, default=None,
-                        help="Maximum parquet files to process per dataset (None for all, default: None = ALL)")
-    parser.add_argument("--chunk-size", type=int, default=100000,
-                        help="Number of images to process in each chunk when loading from parquet files (default: 100000)")
+                        help="Maximum samples to load per dataset (for testing)")
+    parser.add_argument("--balance", action="store_true", default=True,
+                        help="Balance classes by taking min samples per class")
     
     # Training arguments
-    parser.add_argument("--batch-size", type=int, default=256, 
-                        help="Batch size (default: 256 for large GPU, increase for 80GB GPU)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
     parser.add_argument("--img-size", type=int, nargs=2, default=[256, 256],
                         help="Image size (width height)")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--num-workers", type=int, default=8, 
-                        help="DataLoader workers (default: 8, increase for faster data loading)")
-    parser.add_argument("--use-amp", action="store_true", default=True,
-                        help="Use Automatic Mixed Precision (FP16) for faster training and more VRAM usage")
-    parser.add_argument("--no-amp", dest="use_amp", action="store_false",
-                        help="Disable Automatic Mixed Precision")
-    parser.add_argument("--compile-model", action="store_true", default=True,
-                        help="Compile model with torch.compile for faster training (PyTorch 2.0+)")
-    parser.add_argument("--no-compile", dest="compile_model", action="store_false",
-                        help="Disable model compilation")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Model arguments
@@ -960,24 +616,10 @@ if __name__ == "__main__":
     print("IMAGE DETECTOR - ELA+PRNU FUSION")
     print("="*50)
     print(f"Image Size: {args.img_size[0]}x{args.img_size[1]}")
-    print(f"Batch Size: {args.batch_size} (adjust for your GPU VRAM)")
+    print(f"Batch Size: {args.batch_size}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
-    print(f"DataLoader Workers: {args.num_workers}")
-    print(f"Mixed Precision (AMP): {args.use_amp} {'✓' if args.use_amp else '✗'}")
-    print(f"Model Compilation: {args.compile_model} {'✓' if args.compile_model else '✗'}")
-    print(f"Balance Classes: {args.balance} {'⚠️  (WILL DISCARD DATA!)' if args.balance else '✓ (using all data)'}")
-    print(f"Max Parquet Files per Dataset: {args.max_parquet_files if args.max_parquet_files else 'ALL ✓'}")
-    print(f"Max Samples per Dataset: {args.max_samples_per_dataset if args.max_samples_per_dataset else 'ALL ✓'}")
-    print(f"Chunk Size (images per batch): {args.chunk_size:,}")
-    print(f"Using PyTorch DataLoader with direct parquet file reading")
-    
-    # Print GPU info
-    if torch.cuda.is_available():
-        print(f"\nGPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-        print(f"Current VRAM usage: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
-    
+    print(f"Balance Classes: {args.balance}")
     print("="*50 + "\n")
     
     main(args)
